@@ -64,6 +64,8 @@ struct TextureInfo {
 
 class GfxRenderingAPIOGL final : public GfxRenderingAPI {
   public:
+    // Defined out of line: mPostFilter holds a type the header only forward declares
+    GfxRenderingAPIOGL();
     ~GfxRenderingAPIOGL() override;
     const char* GetName() override;
     int GetMaxTextureSize() override;

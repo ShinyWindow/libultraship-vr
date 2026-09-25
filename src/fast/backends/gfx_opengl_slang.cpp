@@ -48,6 +48,15 @@
 namespace Fast {
 namespace fs = std::filesystem;
 
+// Set SLANG_TRACE=1 in the environment to log every step of a frame (crash hunting)
+#define SLANG_TRACE(...)                                                  \
+    do {                                                                  \
+        static const bool sTrace = getenv("SLANG_TRACE") != nullptr;      \
+        if (sTrace) {                                                     \
+            SPDLOG_INFO(__VA_ARGS__);                                     \
+        }                                                                 \
+    } while (0)
+
 namespace {
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -814,6 +823,18 @@ struct GLStateBackup {
     }
 };
 
+// The game renderer binds its vertex buffer and textures once and assumes they stay bound, so every entry point
+// that touches GL state puts it back on the way out
+struct ScopedGLState {
+    GLStateBackup backup;
+    explicit ScopedGLState(int units) {
+        backup.Save(units);
+    }
+    ~ScopedGLState() {
+        backup.Restore();
+    }
+};
+
 void WriteFloat(std::vector<uint8_t>& data, uint32_t offset, float value) {
     if (offset + sizeof(float) <= data.size()) {
         memcpy(data.data() + offset, &value, sizeof(float));
@@ -1491,7 +1512,9 @@ SlangFilterChain::~SlangFilterChain() = default;
 
 bool SlangFilterChain::Load(const std::string& presetPath, std::string& error) {
     Impl& impl = *mImpl;
+    ScopedGLState state(2);
     impl.Destroy();
+    glActiveTexture(GL_TEXTURE0);
 
     GLint major = 0, minor = 0;
     glGetIntegerv(GL_MAJOR_VERSION, &major);
@@ -1592,8 +1615,10 @@ bool SlangFilterChain::Frame(uint32_t sourceTexture, uint32_t sourceWidth, uint3
     for (const Pass& pass : impl.passes) {
         units = std::max(units, pass.maxUnit + 1);
     }
+    SLANG_TRACE("frame: save state ({} units)", units);
     GLStateBackup backup;
     backup.Save(units);
+    SLANG_TRACE("frame: state saved");
 
     glDisable(GL_BLEND);
     glDisable(GL_DEPTH_TEST);
@@ -1606,7 +1631,9 @@ bool SlangFilterChain::Frame(uint32_t sourceTexture, uint32_t sourceWidth, uint3
 
     if (sourceWidth != impl.sourceWidth || sourceHeight != impl.sourceHeight || targetWidth != impl.targetWidth ||
         targetHeight != impl.targetHeight) {
+        SLANG_TRACE("frame: resize {}x{} -> {}x{}", sourceWidth, sourceHeight, targetWidth, targetHeight);
         impl.Resize(sourceWidth, sourceHeight, targetWidth, targetHeight);
+        SLANG_TRACE("frame: resized");
     }
 
     // Keep the previous frames for OriginalHistory#
@@ -1624,7 +1651,9 @@ bool SlangFilterChain::Frame(uint32_t sourceTexture, uint32_t sourceWidth, uint3
         Pass& pass = impl.passes[i];
         const bool last = i + 1 == impl.passes.size();
 
+        SLANG_TRACE("pass {}: begin ({}x{})", i, pass.width, pass.height);
         if (pass.config.mipmapInput) {
+            SLANG_TRACE("pass {}: mipmaps", i);
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D,
                           i == 0 ? sourceTexture : impl.passes[i - 1].texture[impl.OutputSlot(i - 1)]);
@@ -1641,15 +1670,19 @@ bool SlangFilterChain::Frame(uint32_t sourceTexture, uint32_t sourceWidth, uint3
         }
 #endif
         glUseProgram(pass.program);
+        SLANG_TRACE("pass {}: program {} bound", i, pass.program);
         for (BlockBinding& block : pass.blocks) {
             if (block.active) {
                 impl.FillBlock(block, i, frameCount, inputW, inputH);
             }
         }
+        SLANG_TRACE("pass {}: blocks filled", i);
         for (const TextureBinding& binding : pass.textures) {
             impl.BindTexture(binding, i, sourceTexture);
         }
+        SLANG_TRACE("pass {}: textures bound, drawing", i);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        SLANG_TRACE("pass {}: drawn", i);
 
         inputW = pass.width;
         inputH = pass.height;
@@ -1658,6 +1691,7 @@ bool SlangFilterChain::Frame(uint32_t sourceTexture, uint32_t sourceWidth, uint3
     impl.parity ^= 1;
     impl.historyFrame++;
     backup.Restore();
+    SLANG_TRACE("frame: state restored");
     return true;
 }
 

@@ -29,6 +29,8 @@
 #include "ship/config/ConsoleVariable.h"
 
 namespace Fast {
+GfxRenderingAPIOGL::GfxRenderingAPIOGL() = default;
+
 GfxRenderingAPIOGL::~GfxRenderingAPIOGL() = default;
 
 // Post-process filter chain: runs RetroArch .slangp shader presets through the built-in slang runtime
