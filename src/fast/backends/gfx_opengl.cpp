@@ -19,6 +19,7 @@
 #endif
 
 #include "fast/backends/gfx_opengl.h"
+#include "fast/backends/gfx_opengl_slang.h"
 #include "ship/window/gui/Gui.h"
 #include <prism/processor.h>
 #include <fstream>
@@ -28,6 +29,47 @@
 #include "ship/config/ConsoleVariable.h"
 
 namespace Fast {
+GfxRenderingAPIOGL::~GfxRenderingAPIOGL() = default;
+
+// Post-process filter chain: runs RetroArch .slangp shader presets through the built-in slang runtime
+
+bool GfxRenderingAPIOGL::PostFilterLoad(const std::string& presetPath, std::string& error) {
+    PostFilterUnload();
+    auto chain = std::make_unique<SlangFilterChain>();
+    if (!chain->Load(presetPath, error)) {
+        return false;
+    }
+    mPostFilter = std::move(chain);
+    return true;
+}
+
+void GfxRenderingAPIOGL::PostFilterUnload() {
+    mPostFilter.reset();
+}
+
+bool GfxRenderingAPIOGL::PostFilterApply(int fbDstId, int fbSrcId, size_t frameCount) {
+    if (mPostFilter == nullptr || fbDstId <= 0 || fbSrcId <= 0 || fbDstId >= (int)mFrameBuffers.size() ||
+        fbSrcId >= (int)mFrameBuffers.size()) {
+        return false;
+    }
+    const FramebufferOGL& dst = mFrameBuffers[fbDstId];
+    const FramebufferOGL& src = mFrameBuffers[fbSrcId];
+    return mPostFilter->Frame(src.clrbuf, src.width, src.height, dst.fbo, dst.width, dst.height,
+                              (uint32_t)frameCount);
+}
+
+std::vector<PostFilterParam> GfxRenderingAPIOGL::PostFilterGetParams() {
+    return mPostFilter != nullptr ? mPostFilter->GetParams() : std::vector<PostFilterParam>();
+}
+
+bool GfxRenderingAPIOGL::PostFilterGetParam(const std::string& name, float& value) {
+    return mPostFilter != nullptr && mPostFilter->GetParam(name, value);
+}
+
+bool GfxRenderingAPIOGL::PostFilterSetParam(const std::string& name, float value) {
+    return mPostFilter != nullptr && mPostFilter->SetParam(name, value);
+}
+
 int GfxRenderingAPIOGL::GetMaxTextureSize() {
     GLint max_texture_size;
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_texture_size);

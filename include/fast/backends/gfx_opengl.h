@@ -1,6 +1,7 @@
 #ifdef ENABLE_OPENGL
 #pragma once
 
+#include <memory>
 #include "gfx_rendering_api.h"
 #include "../interpreter.h"
 
@@ -28,6 +29,8 @@
 #include <SDL2/SDL_opengl.h>
 #endif
 namespace Fast {
+class SlangFilterChain;
+
 struct ShaderProgram {
     GLuint openglProgramId;
     uint8_t numInputs;
@@ -61,7 +64,7 @@ struct TextureInfo {
 
 class GfxRenderingAPIOGL final : public GfxRenderingAPI {
   public:
-    ~GfxRenderingAPIOGL() override = default;
+    ~GfxRenderingAPIOGL() override;
     const char* GetName() override;
     int GetMaxTextureSize() override;
     GfxClipParameters GetClipParameters() override;
@@ -107,6 +110,12 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     FilteringMode GetTextureFilter() override;
     void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
+    bool PostFilterLoad(const std::string& presetPath, std::string& error) override;
+    void PostFilterUnload() override;
+    bool PostFilterApply(int fbDstId, int fbSrcId, size_t frameCount) override;
+    std::vector<PostFilterParam> PostFilterGetParams() override;
+    bool PostFilterGetParam(const std::string& name, float& value) override;
+    bool PostFilterSetParam(const std::string& name, float value) override;
 
   private:
     void SetUniforms(ShaderProgram* prg) const;
@@ -141,6 +150,9 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     GLuint mPixelDepthRb = 0;
     GLuint mPixelDepthFb = 0;
     size_t mPixelDepthRbSize = 0;
+
+    // Post-process filter chain (RetroArch slang presets)
+    std::unique_ptr<SlangFilterChain> mPostFilter;
 };
 
 } // namespace Fast

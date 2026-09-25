@@ -5047,7 +5047,16 @@ void Interpreter::UpdatePostFilter() {
     }
 
     // Presets reference their shader passes relative to their own location
-    std::string path = std::filesystem::absolute(Ship::Context::LocateFileAcrossAppDirs(preset)).string();
+    std::string path = Ship::Context::LocateFileAcrossAppDirs(preset);
+    if (std::filesystem::exists(path)) {
+        path = std::filesystem::absolute(path).string();
+    }
+#ifdef __SWITCH__
+    else {
+        // The shaders are bundled into the NRO, files next to it take precedence so presets can be customised
+        path = "romfs:/" + preset;
+    }
+#endif
     if (!std::filesystem::exists(path)) {
         mPostFilterError = "Preset not found: " + path;
     } else {

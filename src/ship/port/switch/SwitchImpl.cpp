@@ -33,6 +33,7 @@ void Ship::Switch::Init(SwitchPhase phase) {
         case PreInitPhase:
             DetectAppletMode();
             socketInitializeDefault();
+            romfsInit(); // CRT filter shaders live in the NRO's romfs
 #ifdef DEBUG
             nxlinkStdio();
 #endif
@@ -54,6 +55,7 @@ void Ship::Switch::Init(SwitchPhase phase) {
 }
 
 void Ship::Switch::Exit() {
+    romfsExit();
     socketExit();
     clkrstExit();
     appletSetGamePlayRecordingState(false);
