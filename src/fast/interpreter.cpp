@@ -11,7 +11,10 @@
 #include <dlfcn.h>
 #endif
 
+#include <algorithm>
 #include <any>
+#include <chrono>
+#include <filesystem>
 #include <map>
 #include <set>
 #include <unordered_map>
@@ -4972,6 +4975,7 @@ void Interpreter::Init(class GfxWindowBackend* wapi, class GfxRenderingAPI* rapi
 
     mGameFb = mRapi->CreateFramebuffer();
     mGameFbMsaaResolved = mRapi->CreateFramebuffer();
+    mPostFilterFb = mRapi->CreateFramebuffer();
 
     mNativeDimensions.width = SCREEN_WIDTH;
     mNativeDimensions.height = SCREEN_HEIGHT;
@@ -5024,7 +5028,137 @@ bool Interpreter::IsFrameReady() {
     return mWapi->IsFrameReady();
 }
 
+void Interpreter::UpdatePostFilter() {
+    auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
+    std::string preset;
+    if (cvars->GetInteger(CVAR_PREFIX_CRT_FILTER ".Enabled", 0)) {
+        preset = cvars->GetString(CVAR_PREFIX_CRT_FILTER ".Preset", "");
+    }
+    if (preset == mPostFilterPreset) {
+        return;
+    }
+
+    mPostFilterPreset = preset;
+    mPostFilterError.clear();
+    mPostFilterActive = false;
+    if (preset.empty()) {
+        mRapi->PostFilterUnload();
+        return;
+    }
+
+    // Presets reference their shader passes relative to their own location
+    std::string path = std::filesystem::absolute(Ship::Context::LocateFileAcrossAppDirs(preset)).string();
+    if (!std::filesystem::exists(path)) {
+        mPostFilterError = "Preset not found: " + path;
+    } else {
+        mPostFilterActive = mRapi->PostFilterLoad(path, mPostFilterError);
+    }
+
+    if (!mPostFilterActive) {
+        SPDLOG_ERROR("Could not load post filter preset {}: {}", preset, mPostFilterError);
+        return;
+    }
+    SPDLOG_INFO("Loaded post filter preset {}", path);
+
+    for (const PostFilterParam& param : mRapi->PostFilterGetParams()) {
+        std::string cvar = CVAR_PREFIX_CRT_FILTER ".Params." + param.name;
+        float value = cvars->GetFloat(cvar.c_str(), param.initial);
+        if (value != param.initial) {
+            mRapi->PostFilterSetParam(param.name, value);
+        }
+    }
+}
+
+// While the filter is active the game renders at the line count of the simulated display, and the filtered image
+// is shown at an integer multiple of it so every scanline covers the same number of pixels.
+void Interpreter::ApplyPostFilterResolution(uint32_t availableWidth, uint32_t availableHeight, float pixelScale) {
+    if (!mPostFilterActive || availableWidth == 0 || availableHeight == 0) {
+        return;
+    }
+
+    // The GUI lays out in points on high-DPI displays, scanlines have to line up with real pixels
+    mPostFilterPixelScale = pixelScale > 0.0f ? pixelScale : 1.0f;
+    availableWidth = (uint32_t)(availableWidth * mPostFilterPixelScale);
+    availableHeight = (uint32_t)(availableHeight * mPostFilterPixelScale);
+
+    auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
+    const uint32_t lines = std::clamp(cvars->GetInteger(CVAR_PREFIX_CRT_FILTER ".Lines", 240), 120, 1080);
+    const bool integerScale = cvars->GetInteger(CVAR_PREFIX_CRT_FILTER ".IntegerScale", 1);
+    float aspect;
+    switch (cvars->GetInteger(CVAR_PREFIX_CRT_FILTER ".AspectMode", 0)) {
+        case 1:
+            aspect = 16.0f / 9.0f;
+            break;
+        case 2:
+            aspect = (float)availableWidth / (float)availableHeight;
+            break;
+        default:
+            aspect = 4.0f / 3.0f;
+            break;
+    }
+
+    uint32_t outputHeight = availableHeight;
+    if ((uint32_t)std::lround(outputHeight * aspect) > availableWidth) {
+        outputHeight = (uint32_t)(availableWidth / aspect);
+    }
+    if (integerScale && outputHeight >= lines) {
+        outputHeight = (outputHeight / lines) * lines;
+    }
+
+    mPostFilterOutputHeight = std::max(outputHeight, 1U);
+    mPostFilterOutputWidth = std::clamp((uint32_t)std::lround(outputHeight * aspect), 1U, availableWidth);
+    mCurDimensions.width = (uint32_t)std::lround(lines * aspect);
+    mCurDimensions.height = lines;
+}
+
+void Interpreter::RunPostFilter() {
+    if (!mPostFilterActive || mGfxFrameBuffer == 0 || mPostFilterOutputWidth == 0 || mPostFilterOutputHeight == 0) {
+        return;
+    }
+
+    // Shaders animate (NTSC phase, interlacing) against a 60Hz frame counter, regardless of the output frame rate
+    static const auto start = std::chrono::steady_clock::now();
+    const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - start;
+    const size_t frameCount = (size_t)(elapsed.count() * 60.0);
+
+    const int source = mMsaaLevel > 1 ? mGameFbMsaaResolved : mGameFb;
+    if (mRapi->PostFilterApply(mPostFilterFb, source, frameCount)) {
+        mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mPostFilterFb);
+    }
+}
+
+void Interpreter::ReloadPostFilter() {
+    mPostFilterPreset.clear();
+    mPostFilterActive = false;
+    mRapi->PostFilterUnload();
+}
+
+bool Interpreter::IsPostFilterActive() const {
+    return mPostFilterActive;
+}
+
+const std::string& Interpreter::GetPostFilterError() const {
+    return mPostFilterError;
+}
+
+std::vector<PostFilterParam> Interpreter::GetPostFilterParams() {
+    return mRapi->PostFilterGetParams();
+}
+
+bool Interpreter::GetPostFilterParam(const std::string& name, float& value) {
+    return mRapi->PostFilterGetParam(name, value);
+}
+
+bool Interpreter::SetPostFilterParam(const std::string& name, float value) {
+    return mRapi->PostFilterSetParam(name, value);
+}
+
 bool Interpreter::ViewportMatchesRendererResolution() {
+    if (mPostFilterActive || mRapi->IsHdrOutputActive()) {
+        // The filter and the HDR conversion need the game image as a texture, so it can't be drawn straight to
+        // the window
+        return false;
+    }
 #ifdef __APPLE__
     // Always treat the viewport as not matching the render resolution on mac
     // to avoid issues with retina scaling.
@@ -5066,6 +5200,18 @@ void Interpreter::StartFrame() {
 
     mPrvDimensions = mCurDimensions;
     mPrevNativeDimensions = mNativeDimensions;
+    UpdatePostFilter();
+    {
+        auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
+        const float paperWhiteNits = cvars->GetFloat(CVAR_PREFIX_CRT_FILTER ".Hdr.PaperWhiteNits", 200.0f);
+        const float crtNits = cvars->GetFloat(CVAR_PREFIX_CRT_FILTER ".Hdr.CrtNits", 500.0f);
+        mRapi->SetHdrOutput(cvars->GetInteger(CVAR_PREFIX_CRT_FILTER ".Hdr.Enabled", 0), paperWhiteNits,
+                            mPostFilterActive ? crtNits : paperWhiteNits);
+    }
+    if (mPostFilterActive && mPostFilterOutputWidth > 0 && mPostFilterOutputHeight > 0) {
+        mRapi->UpdateFramebufferParameters(mPostFilterFb, mPostFilterOutputWidth, mPostFilterOutputHeight, 1, false,
+                                           true, false, false);
+    }
     if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1) {
         mRendersToFb = true;
         if (!ViewportMatchesRendererResolution()) {
@@ -5121,6 +5267,7 @@ void Interpreter::RunGuiOnly() {
         } else {
             mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFb);
         }
+        RunPostFilter();
     } else if (mFbActive) {
         // Failsafe reset to main framebuffer to prevent softlocking the renderer
         mFbActive = 0;
@@ -5186,6 +5333,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
         } else {
             mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFb);
         }
+        RunPostFilter();
     } else if (mFbActive) {
         // Failsafe reset to main framebuffer to prevent softlocking the renderer
         mFbActive = 0;

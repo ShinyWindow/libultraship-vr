@@ -389,6 +389,18 @@ class Interpreter {
     void HandleWindowEvents();
     bool IsFrameReady();
     bool ViewportMatchesRendererResolution();
+
+    // Post-process filter (CRT shader preset) applied to the finished game image, driven by the
+    // CVAR_PREFIX_CRT_FILTER console variables
+    void UpdatePostFilter();
+    void ApplyPostFilterResolution(uint32_t availableWidth, uint32_t availableHeight, float pixelScale = 1.0f);
+    void ReloadPostFilter();
+    void RunPostFilter();
+    bool IsPostFilterActive() const;
+    const std::string& GetPostFilterError() const;
+    std::vector<PostFilterParam> GetPostFilterParams();
+    bool GetPostFilterParam(const std::string& name, float& value);
+    bool SetPostFilterParam(const std::string& name, float value);
     int GetTargetFps();
     void SetTargetFps(int fps);
     void SetMaxFrameLatency(int latency);
@@ -541,6 +553,14 @@ class Interpreter {
 
     int mGameFb{};             // game_framebuffer;
     int mGameFbMsaaResolved{}; // game_framebuffer_msaa_resolved;
+
+    int mPostFilterFb{};
+    bool mPostFilterActive{};
+    std::string mPostFilterPreset;
+    std::string mPostFilterError;
+    uint32_t mPostFilterOutputWidth{}; // size the filtered image is displayed at, in pixels
+    uint32_t mPostFilterOutputHeight{};
+    float mPostFilterPixelScale = 1.0f; // pixels per ImGui unit, above 1 on high-DPI displays
 
     std::set<std::pair<float, float>> mGetPixelDepthPending; // get_pixel_depth_pending;
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> mGetPixelDepthCached; // get_pixel_depth_cached;

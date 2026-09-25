@@ -10,6 +10,9 @@
 #include "d3d11.h"
 #include "d3dcompiler.h"
 
+// librashader filter chain handle (see fast/backends/librashader/librashader.h)
+struct _filter_chain_d3d11;
+
 namespace Fast {
 
 struct PerFrameCB {
@@ -118,6 +121,18 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     FilteringMode GetTextureFilter() override;
     void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
+    bool PostFilterLoad(const std::string& presetPath, std::string& error) override;
+    void PostFilterUnload() override;
+    bool PostFilterApply(int fbDstId, int fbSrcId, size_t frameCount) override;
+    std::vector<PostFilterParam> PostFilterGetParams() override;
+    bool PostFilterGetParam(const std::string& name, float& value) override;
+    bool PostFilterSetParam(const std::string& name, float value) override;
+    void SetHdrOutput(bool enabled, float paperWhiteNits, float gameNits) override;
+    bool IsHdrOutputActive() override;
+    void HdrPrepareDrawData(ImDrawData* data) override;
+    void HdrBeginGameImage(ImDrawList* list) override;
+    void HdrEndGameImage(ImDrawList* list) override;
+    void HdrBindPixelShader(bool gameImage);
 
     PFN_D3D11_CREATE_DEVICE mDX11CreateDevice;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> mContext;
@@ -190,6 +205,19 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11Texture2D> mReadbackStaging;
     uint32_t mReadbackStagingW = 0;
     uint32_t mReadbackStagingH = 0;
+
+    // Post-process filter chain (librashader)
+    _filter_chain_d3d11* mPostFilterChain = nullptr;
+    std::vector<PostFilterParam> mPostFilterParams;
+
+    // HDR output
+    bool mHdrActive = false;
+    uint32_t mHdrDisplayCheckTimer = 0;
+    float mHdrPaperWhiteNits = 200.0f;
+    float mHdrGameNits = 200.0f;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> mHdrPixelShader;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mHdrUiCb;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mHdrGameCb;
 };
 
 std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures& cc_features,

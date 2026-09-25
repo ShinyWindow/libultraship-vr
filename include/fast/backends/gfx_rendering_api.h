@@ -4,7 +4,12 @@
 
 #include <unordered_map>
 #include <set>
+#include <string>
+#include <vector>
 #include "imconfig.h"
+
+struct ImDrawData;
+struct ImDrawList;
 
 namespace Fast {
 struct ShaderProgram;
@@ -15,6 +20,16 @@ struct GfxClipParameters {
 };
 
 enum FilteringMode { FILTER_THREE_POINT, FILTER_LINEAR, FILTER_NONE };
+
+// A runtime parameter exposed by a post-process filter preset (RetroArch .slangp)
+struct PostFilterParam {
+    std::string name;
+    std::string description;
+    float initial;
+    float minimum;
+    float maximum;
+    float step;
+};
 
 // A hash function used to hash a: pair<float, float>
 struct hash_pair_ff {
@@ -79,6 +94,41 @@ class GfxRenderingAPI {
     virtual void SetSrgbMode() = 0;
     virtual ImTextureID GetTextureById(int id) = 0;
     virtual void SetCurrentPrimDepth(float depth) = 0;
+
+    // Post-process filter chain applied to the finished game image (RetroArch .slangp presets).
+    // Backends that don't support it keep these defaults, which leaves the game image untouched.
+    virtual bool PostFilterLoad(const std::string& presetPath, std::string& error) {
+        error = "Post-process filters are not supported by this rendering backend";
+        return false;
+    }
+    virtual void PostFilterUnload() {
+    }
+    virtual bool PostFilterApply(int fbDstId, int fbSrcId, size_t frameCount) {
+        return false;
+    }
+    virtual std::vector<PostFilterParam> PostFilterGetParams() {
+        return {};
+    }
+    virtual bool PostFilterGetParam(const std::string& name, float& value) {
+        return false;
+    }
+    virtual bool PostFilterSetParam(const std::string& name, float value) {
+        return false;
+    }
+
+    // HDR output. While active the window is presented in scRGB, the game image is shown at gameNits and the
+    // user interface at paperWhiteNits. Backends without support keep presenting in SDR.
+    virtual void SetHdrOutput(bool enabled, float paperWhiteNits, float gameNits) {
+    }
+    virtual bool IsHdrOutputActive() {
+        return false;
+    }
+    virtual void HdrPrepareDrawData(ImDrawData* data) {
+    }
+    virtual void HdrBeginGameImage(ImDrawList* list) {
+    }
+    virtual void HdrEndGameImage(ImDrawList* list) {
+    }
 
   protected:
     int8_t mCurrentDepthTest = 0;

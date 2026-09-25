@@ -85,6 +85,12 @@ void Gui::Init() {
     Ship::Switch::ImGuiSetupFont(mImGuiIo->Fonts);
 #endif
 
+#ifdef __SWITCH__
+    Ship::Switch::CreateKeyboard();
+    Ship::Switch::ImGuiSetupFont(mImGuiIo->Fonts);
+    ImGui::GetStyle().ScaleAllSizes(2.0f);
+#endif
+
 #if defined(__ANDROID__)
     // Scale everything by 2 for Android
     ImGui::GetStyle().ScaleAllSizes(2.0f);

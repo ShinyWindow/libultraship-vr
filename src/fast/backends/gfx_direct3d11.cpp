@@ -12,6 +12,7 @@
 #include <wrl/client.h>
 
 #include <dxgi1_3.h>
+#include <dxgi1_6.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
 
@@ -44,6 +45,9 @@
 
 #include "fast/Fast3dWindow.h"
 
+#define LIBRA_RUNTIME_D3D11
+#include "fast/backends/librashader/librashader_ld.h"
+
 #define DEBUG_D3D 0
 
 using namespace Microsoft::WRL; // For ComPtr
@@ -51,6 +55,7 @@ using namespace Microsoft::WRL; // For ComPtr
 namespace Fast {
 
 GfxRenderingAPIDX11::~GfxRenderingAPIDX11() {
+    PostFilterUnload();
 }
 
 GfxRenderingAPIDX11::GfxRenderingAPIDX11(GfxWindowBackendDXGI* backend) {
@@ -1237,6 +1242,441 @@ ImTextureID GfxRenderingAPIDX11::GetTextureById(int id) {
 
 void GfxRenderingAPIDX11::SetSrgbMode() {
     mSrgbMode = true;
+}
+
+// Post-process filter chain: runs RetroArch .slangp shader presets through librashader.
+// librashader.dll is loaded on first use; when it is missing every call fails gracefully.
+
+namespace {
+libra_instance_t& GetLibrashader() {
+    static libra_instance_t instance = librashader_load_instance();
+    return instance;
+}
+
+std::string ConsumeLibrashaderError(libra_error_t error) {
+    libra_instance_t& libra = GetLibrashader();
+    std::string message = "Unknown librashader error";
+    char* text = nullptr;
+    if (libra.error_write(error, &text) == 0 && text != nullptr) {
+        message = text;
+        libra.error_free_string(&text);
+    }
+    libra.error_free(&error);
+    return message;
+}
+
+// librashader binds its own pipeline state, while this backend skips redundant state changes based on what it
+// bound last. Saving and restoring the context around the filter keeps both views consistent.
+struct D3D11StateBackup {
+    static constexpr UINT kSlots = 16;
+    static constexpr UINT kBuffers = 4;
+
+    explicit D3D11StateBackup(ID3D11DeviceContext* context) : mContext(context) {
+        mScissorCount = mViewportCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+        mContext->RSGetScissorRects(&mScissorCount, mScissors);
+        mContext->RSGetViewports(&mViewportCount, mViewports);
+        mContext->RSGetState(&mRasterizerState);
+        mContext->OMGetBlendState(&mBlendState, mBlendFactor, &mSampleMask);
+        mContext->OMGetDepthStencilState(&mDepthStencilState, &mStencilRef);
+        mContext->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, mRenderTargets, &mDepthStencilView);
+        mContext->PSGetShaderResources(0, kSlots, mPsResources);
+        mContext->PSGetSamplers(0, kSlots, mPsSamplers);
+        mContext->VSGetShaderResources(0, kSlots, mVsResources);
+        mContext->VSGetSamplers(0, kSlots, mVsSamplers);
+        mContext->PSGetShader(&mPixelShader, nullptr, nullptr);
+        mContext->VSGetShader(&mVertexShader, nullptr, nullptr);
+        mContext->GSGetShader(&mGeometryShader, nullptr, nullptr);
+        mContext->VSGetConstantBuffers(0, kBuffers, mVsConstantBuffers);
+        mContext->PSGetConstantBuffers(0, kBuffers, mPsConstantBuffers);
+        mContext->IAGetPrimitiveTopology(&mTopology);
+        mContext->IAGetIndexBuffer(&mIndexBuffer, &mIndexBufferFormat, &mIndexBufferOffset);
+        mContext->IAGetVertexBuffers(0, 1, &mVertexBuffer, &mVertexBufferStride, &mVertexBufferOffset);
+        mContext->IAGetInputLayout(&mInputLayout);
+    }
+
+    ~D3D11StateBackup() {
+        mContext->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, mRenderTargets, mDepthStencilView);
+        mContext->RSSetScissorRects(mScissorCount, mScissors);
+        mContext->RSSetViewports(mViewportCount, mViewports);
+        mContext->RSSetState(mRasterizerState);
+        mContext->OMSetBlendState(mBlendState, mBlendFactor, mSampleMask);
+        mContext->OMSetDepthStencilState(mDepthStencilState, mStencilRef);
+        mContext->PSSetShaderResources(0, kSlots, mPsResources);
+        mContext->PSSetSamplers(0, kSlots, mPsSamplers);
+        mContext->VSSetShaderResources(0, kSlots, mVsResources);
+        mContext->VSSetSamplers(0, kSlots, mVsSamplers);
+        mContext->PSSetShader(mPixelShader, nullptr, 0);
+        mContext->VSSetShader(mVertexShader, nullptr, 0);
+        mContext->GSSetShader(mGeometryShader, nullptr, 0);
+        mContext->VSSetConstantBuffers(0, kBuffers, mVsConstantBuffers);
+        mContext->PSSetConstantBuffers(0, kBuffers, mPsConstantBuffers);
+        mContext->IASetPrimitiveTopology(mTopology);
+        mContext->IASetIndexBuffer(mIndexBuffer, mIndexBufferFormat, mIndexBufferOffset);
+        mContext->IASetVertexBuffers(0, 1, &mVertexBuffer, &mVertexBufferStride, &mVertexBufferOffset);
+        mContext->IASetInputLayout(mInputLayout);
+
+        Release(mRasterizerState);
+        Release(mBlendState);
+        Release(mDepthStencilState);
+        Release(mDepthStencilView);
+        Release(mPixelShader);
+        Release(mVertexShader);
+        Release(mGeometryShader);
+        Release(mIndexBuffer);
+        Release(mVertexBuffer);
+        Release(mInputLayout);
+        for (auto& view : mRenderTargets) {
+            Release(view);
+        }
+        for (UINT i = 0; i < kSlots; i++) {
+            Release(mPsResources[i]);
+            Release(mPsSamplers[i]);
+            Release(mVsResources[i]);
+            Release(mVsSamplers[i]);
+        }
+        for (UINT i = 0; i < kBuffers; i++) {
+            Release(mVsConstantBuffers[i]);
+            Release(mPsConstantBuffers[i]);
+        }
+    }
+
+    D3D11StateBackup(const D3D11StateBackup&) = delete;
+    D3D11StateBackup& operator=(const D3D11StateBackup&) = delete;
+
+  private:
+    template <typename T> static void Release(T*& object) {
+        if (object != nullptr) {
+            object->Release();
+            object = nullptr;
+        }
+    }
+
+    ID3D11DeviceContext* mContext;
+    UINT mScissorCount = 0;
+    UINT mViewportCount = 0;
+    D3D11_RECT mScissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
+    D3D11_VIEWPORT mViewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
+    ID3D11RasterizerState* mRasterizerState = nullptr;
+    ID3D11BlendState* mBlendState = nullptr;
+    FLOAT mBlendFactor[4] = {};
+    UINT mSampleMask = 0;
+    ID3D11DepthStencilState* mDepthStencilState = nullptr;
+    UINT mStencilRef = 0;
+    ID3D11RenderTargetView* mRenderTargets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+    ID3D11DepthStencilView* mDepthStencilView = nullptr;
+    ID3D11ShaderResourceView* mPsResources[kSlots] = {};
+    ID3D11SamplerState* mPsSamplers[kSlots] = {};
+    ID3D11ShaderResourceView* mVsResources[kSlots] = {};
+    ID3D11SamplerState* mVsSamplers[kSlots] = {};
+    ID3D11PixelShader* mPixelShader = nullptr;
+    ID3D11VertexShader* mVertexShader = nullptr;
+    ID3D11GeometryShader* mGeometryShader = nullptr;
+    ID3D11Buffer* mVsConstantBuffers[kBuffers] = {};
+    ID3D11Buffer* mPsConstantBuffers[kBuffers] = {};
+    D3D11_PRIMITIVE_TOPOLOGY mTopology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    ID3D11Buffer* mIndexBuffer = nullptr;
+    DXGI_FORMAT mIndexBufferFormat = DXGI_FORMAT_UNKNOWN;
+    UINT mIndexBufferOffset = 0;
+    ID3D11Buffer* mVertexBuffer = nullptr;
+    UINT mVertexBufferStride = 0;
+    UINT mVertexBufferOffset = 0;
+    ID3D11InputLayout* mInputLayout = nullptr;
+};
+} // namespace
+
+bool GfxRenderingAPIDX11::PostFilterLoad(const std::string& presetPath, std::string& error) {
+    PostFilterUnload();
+
+    libra_instance_t& libra = GetLibrashader();
+    if (!libra.instance_loaded) {
+        error = "librashader.dll was not found next to the executable";
+        return false;
+    }
+
+    libra_shader_preset_t preset = nullptr;
+    if (libra_error_t err = libra.preset_create(presetPath.c_str(), &preset)) {
+        error = ConsumeLibrashaderError(err);
+        return false;
+    }
+
+    // The preset is consumed by filter chain creation, so its parameter metadata has to be read first
+    libra_preset_param_list_t paramList = {};
+    if (libra_error_t err = libra.preset_get_runtime_params(&preset, &paramList)) {
+        SPDLOG_WARN("Could not read post filter parameters: {}", ConsumeLibrashaderError(err));
+    } else {
+        for (uint64_t i = 0; i < paramList.length; i++) {
+            const libra_preset_param_t& param = paramList.parameters[i];
+            mPostFilterParams.push_back({ param.name != nullptr ? param.name : "",
+                                          param.description != nullptr ? param.description : "", param.initial,
+                                          param.minimum, param.maximum, param.step });
+        }
+        libra.preset_free_runtime_params(paramList);
+    }
+
+    libra_d3d11_filter_chain_t chain = nullptr;
+    if (libra_error_t err = libra.d3d11_filter_chain_create(&preset, mDevice.Get(), nullptr, &chain)) {
+        error = ConsumeLibrashaderError(err);
+        if (preset != nullptr) {
+            libra.preset_free(&preset);
+        }
+        mPostFilterParams.clear();
+        return false;
+    }
+
+    mPostFilterChain = chain;
+
+    // Presets can override the defaults declared by their shaders, those are the values to reset to
+    for (PostFilterParam& param : mPostFilterParams) {
+        PostFilterGetParam(param.name, param.initial);
+    }
+    return true;
+}
+
+void GfxRenderingAPIDX11::PostFilterUnload() {
+    if (mPostFilterChain != nullptr) {
+        libra_d3d11_filter_chain_t chain = mPostFilterChain;
+        if (libra_error_t err = GetLibrashader().d3d11_filter_chain_free(&chain)) {
+            SPDLOG_WARN("Could not free post filter chain: {}", ConsumeLibrashaderError(err));
+        }
+        mPostFilterChain = nullptr;
+    }
+    mPostFilterParams.clear();
+}
+
+bool GfxRenderingAPIDX11::PostFilterApply(int fbDstId, int fbSrcId, size_t frameCount) {
+    if (mPostFilterChain == nullptr) {
+        return false;
+    }
+
+    TextureData& dstTexture = mTextures[mFrameBuffers[fbDstId].texture_id];
+    ID3D11RenderTargetView* target = mFrameBuffers[fbDstId].render_target_view.Get();
+    ID3D11ShaderResourceView* source = mTextures[mFrameBuffers[fbSrcId].texture_id].resource_view.Get();
+    if (target == nullptr || source == nullptr) {
+        return false;
+    }
+
+    D3D11StateBackup backup(mContext.Get());
+
+    libra_d3d11_filter_chain_t chain = mPostFilterChain;
+    libra_viewport_t viewport = { 0.0f, 0.0f, dstTexture.width, dstTexture.height };
+    if (libra_error_t err = GetLibrashader().d3d11_filter_chain_frame(&chain, nullptr, frameCount, source, target,
+                                                                      &viewport, nullptr, nullptr)) {
+        SPDLOG_ERROR("Post filter failed to draw: {}", ConsumeLibrashaderError(err));
+        return false;
+    }
+    return true;
+}
+
+std::vector<PostFilterParam> GfxRenderingAPIDX11::PostFilterGetParams() {
+    return mPostFilterParams;
+}
+
+bool GfxRenderingAPIDX11::PostFilterGetParam(const std::string& name, float& value) {
+    if (mPostFilterChain == nullptr) {
+        return false;
+    }
+    libra_d3d11_filter_chain_t chain = mPostFilterChain;
+    if (libra_error_t err = GetLibrashader().d3d11_filter_chain_get_param(&chain, name.c_str(), &value)) {
+        GetLibrashader().error_free(&err);
+        return false;
+    }
+    return true;
+}
+
+// HDR output: the swap chain is switched to scRGB (linear, 1.0 = 80 nits) while the display is in HDR mode.
+// Everything reaches the window through ImGui, so ImGui's pixel shader is swapped for one that converts the SDR
+// image and interface to scRGB at the requested brightness.
+
+namespace {
+const char* sHdrPixelShader = R"(
+cbuffer HdrCB : register(b3) {
+    float scale;
+    float3 padding;
+};
+struct PS_INPUT {
+    float4 pos : SV_POSITION;
+    float4 col : COLOR0;
+    float2 uv : TEXCOORD0;
+};
+sampler sampler0;
+Texture2D texture0;
+
+float3 SrgbToLinear(float3 c) {
+    return lerp(c / 12.92, pow((c + 0.055) / 1.055, 2.4), step(0.04045, c));
+}
+
+float4 main(PS_INPUT input) : SV_Target {
+    float4 color = input.col * texture0.Sample(sampler0, input.uv);
+    color.rgb = SrgbToLinear(saturate(color.rgb)) * scale;
+    return color;
+}
+)";
+
+struct HdrCB {
+    float scale;
+    float padding[3];
+};
+
+// A fresh factory is needed to see HDR being toggled in Windows while the game is running
+bool IsWindowOnHdrDisplay(HWND window) {
+    HMODULE dxgiModule = GetModuleHandleW(L"dxgi.dll");
+    if (dxgiModule == nullptr) {
+        return false;
+    }
+    typedef HRESULT(WINAPI * CreateFactoryFn)(REFIID, void**);
+    auto createFactory = (CreateFactoryFn)GetProcAddress(dxgiModule, "CreateDXGIFactory1");
+    ComPtr<IDXGIFactory1> factory;
+    if (createFactory == nullptr || FAILED(createFactory(IID_PPV_ARGS(&factory)))) {
+        return false;
+    }
+
+    HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+    ComPtr<IDXGIAdapter1> adapter;
+    for (UINT a = 0; factory->EnumAdapters1(a, adapter.ReleaseAndGetAddressOf()) != DXGI_ERROR_NOT_FOUND; a++) {
+        ComPtr<IDXGIOutput> output;
+        for (UINT o = 0; adapter->EnumOutputs(o, output.ReleaseAndGetAddressOf()) != DXGI_ERROR_NOT_FOUND; o++) {
+            ComPtr<IDXGIOutput6> output6;
+            DXGI_OUTPUT_DESC1 desc;
+            if (SUCCEEDED(output.As(&output6)) && SUCCEEDED(output6->GetDesc1(&desc)) && desc.Monitor == monitor) {
+                return desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+            }
+        }
+    }
+    return false;
+}
+
+void HdrUiCallback(const ImDrawList* list, const ImDrawCmd* cmd) {
+    static_cast<GfxRenderingAPIDX11*>(cmd->UserCallbackData)->HdrBindPixelShader(false);
+}
+
+void HdrGameImageCallback(const ImDrawList* list, const ImDrawCmd* cmd) {
+    static_cast<GfxRenderingAPIDX11*>(cmd->UserCallbackData)->HdrBindPixelShader(true);
+}
+} // namespace
+
+void GfxRenderingAPIDX11::SetHdrOutput(bool enabled, float paperWhiteNits, float gameNits) {
+    mHdrPaperWhiteNits = paperWhiteNits;
+    mHdrGameNits = gameNits;
+
+    bool wantActive = false;
+    if (enabled) {
+        // Checking the display is not free, and it only changes when HDR is toggled in Windows
+        if (mHdrDisplayCheckTimer++ % (mHdrActive ? 300 : 60) != 0) {
+            return;
+        }
+        wantActive = IsWindowOnHdrDisplay(mWindowBackend->GetWindowHandle());
+    } else {
+        mHdrDisplayCheckTimer = 0;
+    }
+    if (wantActive == mHdrActive) {
+        return;
+    }
+
+    IDXGISwapChain1* swapChain = mWindowBackend->GetSwapChain();
+    ComPtr<IDXGISwapChain3> swapChain3;
+    DXGI_SWAP_CHAIN_DESC1 desc;
+    if (FAILED(swapChain->QueryInterface(IID_PPV_ARGS(&swapChain3))) || FAILED(swapChain->GetDesc1(&desc))) {
+        SPDLOG_WARN("HDR output needs DXGI 1.4");
+        return;
+    }
+
+    // Every reference to the back buffer has to be gone before its format can change.
+    // UpdateFramebufferParameters() picks the new buffer up again before the next draw.
+    FramebufferDX11& fb = mFrameBuffers[0];
+    mContext->OMSetRenderTargets(0, nullptr, nullptr);
+    fb.render_target_view.Reset();
+    mTextures[fb.texture_id].texture.Reset();
+    mContext->Flush();
+
+    const DXGI_FORMAT format = wantActive ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (FAILED(swapChain->ResizeBuffers(0, desc.Width, desc.Height, format, desc.Flags))) {
+        SPDLOG_ERROR("Could not switch the swap chain to {}", wantActive ? "HDR" : "SDR");
+        return;
+    }
+    swapChain3->SetColorSpace1(wantActive ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+                                          : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+    mHdrActive = wantActive;
+    SPDLOG_INFO("HDR output {}", mHdrActive ? "enabled" : "disabled");
+}
+
+bool GfxRenderingAPIDX11::IsHdrOutputActive() {
+    return mHdrActive;
+}
+
+void GfxRenderingAPIDX11::HdrBindPixelShader(bool gameImage) {
+    ID3D11Buffer* buffer = gameImage ? mHdrGameCb.Get() : mHdrUiCb.Get();
+    mContext->PSSetShader(mHdrPixelShader.Get(), nullptr, 0);
+    mContext->PSSetConstantBuffers(3, 1, &buffer);
+}
+
+void GfxRenderingAPIDX11::HdrPrepareDrawData(ImDrawData* data) {
+    if (!mHdrActive) {
+        return;
+    }
+
+    if (mHdrPixelShader.Get() == nullptr) {
+        ComPtr<ID3DBlob> blob, errors;
+        if (FAILED(mD3dCompile(sHdrPixelShader, strlen(sHdrPixelShader), nullptr, nullptr, nullptr, "main", "ps_4_0",
+                               0, 0, blob.GetAddressOf(), errors.GetAddressOf()))) {
+            SPDLOG_ERROR("Could not compile the HDR pixel shader: {}",
+                         errors.Get() != nullptr ? (const char*)errors->GetBufferPointer() : "unknown error");
+            return;
+        }
+        ThrowIfFailed(mDevice->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+                                                 mHdrPixelShader.GetAddressOf()));
+
+        D3D11_BUFFER_DESC bufferDesc = {};
+        bufferDesc.ByteWidth = sizeof(HdrCB);
+        bufferDesc.Usage = D3D11_USAGE_DYNAMIC;
+        bufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bufferDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        ThrowIfFailed(mDevice->CreateBuffer(&bufferDesc, nullptr, mHdrUiCb.GetAddressOf()));
+        ThrowIfFailed(mDevice->CreateBuffer(&bufferDesc, nullptr, mHdrGameCb.GetAddressOf()));
+    }
+
+    // scRGB puts 1.0 at 80 nits
+    const std::pair<ID3D11Buffer*, float> buffers[] = { { mHdrUiCb.Get(), mHdrPaperWhiteNits / 80.0f },
+                                                        { mHdrGameCb.Get(), mHdrGameNits / 80.0f } };
+    for (const auto& [buffer, scale] : buffers) {
+        D3D11_MAPPED_SUBRESOURCE ms;
+        ZeroMemory(&ms, sizeof(D3D11_MAPPED_SUBRESOURCE));
+        mContext->Map(buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
+        HdrCB cb = { scale, { 0.0f, 0.0f, 0.0f } };
+        memcpy(ms.pData, &cb, sizeof(HdrCB));
+        mContext->Unmap(buffer, 0);
+    }
+
+    // ImGui binds its own pixel shader once per frame, take over at the start of every draw list
+    for (ImDrawList* list : data->CmdLists) {
+        ImDrawCmd cmd = {};
+        cmd.UserCallback = HdrUiCallback;
+        cmd.UserCallbackData = this;
+        list->CmdBuffer.insert(list->CmdBuffer.begin(), cmd);
+    }
+}
+
+void GfxRenderingAPIDX11::HdrBeginGameImage(ImDrawList* list) {
+    if (mHdrActive && mHdrPixelShader.Get() != nullptr) {
+        list->AddCallback(HdrGameImageCallback, this);
+    }
+}
+
+void GfxRenderingAPIDX11::HdrEndGameImage(ImDrawList* list) {
+    if (mHdrActive && mHdrPixelShader.Get() != nullptr) {
+        list->AddCallback(HdrUiCallback, this);
+    }
+}
+
+bool GfxRenderingAPIDX11::PostFilterSetParam(const std::string& name, float value) {
+    if (mPostFilterChain == nullptr) {
+        return false;
+    }
+    libra_d3d11_filter_chain_t chain = mPostFilterChain;
+    if (libra_error_t err = GetLibrashader().d3d11_filter_chain_set_param(&chain, name.c_str(), value)) {
+        GetLibrashader().error_free(&err);
+        return false;
+    }
+    return true;
 }
 
 #define RAND_NOISE "((random(float3(floor(screenSpace.xy * noise_scale), noise_frame)) + 1.0) / 2.0)"

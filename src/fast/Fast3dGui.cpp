@@ -271,6 +271,10 @@ void Fast3dGui::ImGuiRenderDrawData(ImDrawData* data) {
 
 #ifdef ENABLE_DX11
         case WindowBackend::FAST3D_DXGI_DX11:
+            if (data == ImGui::GetDrawData()) {
+                // Floating windows have SDR swap chains of their own
+                mInterpreter.lock()->GetCurrentRenderingAPI()->HdrPrepareDrawData(data);
+            }
             ImGui_ImplDX11_RenderDrawData(data);
             break;
 #endif
@@ -362,6 +366,10 @@ void Fast3dGui::CalculateGameViewport() {
         }
     }
 
+    // The CRT filter dictates its own render resolution, overriding the settings above while it is active
+    interpreter->UpdatePostFilter();
+    interpreter->ApplyPostFilterResolution((uint32_t)size.x, (uint32_t)size.y);
+
     ImGui::End();
 }
 
@@ -384,8 +392,14 @@ void Fast3dGui::DrawGame() {
     ImVec2 pos = ImVec2(0, 0);
     const auto interpreter = mInterpreter.lock().get();
 
-    if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_LOW_RES_MODE, 0) ==
-        1) { // N64 Mode takes priority
+    if (interpreter->IsPostFilterActive() && interpreter->mPostFilterOutputWidth > 0) {
+        // The filtered image is already at its display size, show it 1:1
+        const ImVec2 filtered((float)interpreter->mPostFilterOutputWidth / interpreter->mPostFilterPixelScale,
+                              (float)interpreter->mPostFilterOutputHeight / interpreter->mPostFilterPixelScale);
+        pos = ImVec2(floor((size.x - filtered.x) / 2.0f), floor((size.y - filtered.y) / 2.0f));
+        size = filtered;
+    } else if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_LOW_RES_MODE, 0) ==
+               1) { // N64 Mode takes priority
         const float sw = size.y * 320.0f / 240.0f;
         pos = ImVec2(floor(size.x / 2 - sw / 2), 0);
         size = ImVec2(sw, size.y);
@@ -422,8 +436,11 @@ void Fast3dGui::DrawGame() {
     }
     uintptr_t fb = Ship::Context::GetRawInstance()->GetWindow()->GetGfxFrameBuffer();
     if (fb) {
+        GfxRenderingAPI* api = interpreter->GetCurrentRenderingAPI();
         ImGui::SetCursorPos(pos);
+        api->HdrBeginGameImage(ImGui::GetWindowDrawList());
         ImGui::Image(reinterpret_cast<ImTextureID>(fb), size);
+        api->HdrEndGameImage(ImGui::GetWindowDrawList());
     }
 
     ImGui::End();
