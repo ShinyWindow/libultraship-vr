@@ -72,7 +72,7 @@ target_include_directories(libultraship
 
 #=================== Linking ===================
 if(INCLUDE_MPQ_SUPPORT)
-    if (NOT CMAKE_SYSTEM_NAME STREQUAL "Windows" AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    if (NOT CMAKE_SYSTEM_NAME STREQUAL "Windows" AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" AND NOT CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
         target_link_libraries(libultraship PUBLIC "$<LINK_LIBRARY:WHOLE_ARCHIVE,storm>")
     else()
         target_link_libraries(libultraship PUBLIC storm)
@@ -258,4 +258,3 @@ if ("${CMAKE_CXX_COMPILER_ID}" MATCHES "GNU|Clang")
     )
     endif()
 endif()
-

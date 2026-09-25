@@ -42,9 +42,11 @@ std::shared_ptr<ControllerGyroMapping> GyroMappingFactory::CreateGyroMappingFrom
                                           ->GetControlDeck()
                                           ->GetConnectedPhysicalDeviceManager()
                                           ->GetConnectedSDLGamepadsForPort(portIndex)) {
+#ifndef __SWITCH__
         if (!SDL_GameControllerHasSensor(gamepad, SDL_SENSOR_GYRO)) {
             continue;
         }
+#endif
 
         for (int32_t button = SDL_CONTROLLER_BUTTON_A; button < SDL_CONTROLLER_BUTTON_MAX; button++) {
             if (SDL_GameControllerGetButton(gamepad, static_cast<SDL_GameControllerButton>(button))) {

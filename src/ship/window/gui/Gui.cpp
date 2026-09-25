@@ -15,6 +15,9 @@
 #include "ship/window/gui/Fonts.h"
 #include "ship/window/gui/resource/GuiTextureFactory.h"
 #include "ship/window/gui/resource/GuiTexture.h"
+#ifdef __SWITCH__
+#include "ship/port/switch/SwitchImpl.h"
+#endif
 
 namespace Ship {
 #define TOGGLE_BTN ImGuiKey_F1
@@ -77,6 +80,10 @@ void Gui::Init() {
     iconsConfig.GlyphMinAdvanceX = iconFontSize;
     mImGuiIo->Fonts->AddFontFromMemoryCompressedBase85TTF(fontawesome_compressed_data_base85, iconFontSize,
                                                           &iconsConfig, sIconsRanges);
+#ifdef __SWITCH__
+    Ship::Switch::CreateKeyboard();
+    Ship::Switch::ImGuiSetupFont(mImGuiIo->Fonts);
+#endif
 
 #if defined(__ANDROID__)
     // Scale everything by 2 for Android
@@ -112,6 +119,9 @@ void Gui::Init() {
 
     ImGuiWMInit();
     ImGuiBackendInit();
+#ifdef __SWITCH__
+    Ship::Switch::ApplyOverclock();
+#endif
 }
 
 void Gui::ImGuiWMInit() {

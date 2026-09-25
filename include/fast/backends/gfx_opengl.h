@@ -16,6 +16,9 @@
 #elif __APPLE__
 #include <SDL2/SDL.h>
 #include <GL/glew.h>
+#elif __SWITCH__
+#include <SDL2/SDL.h>
+#include <glad/glad.h>
 #elif USE_OPENGLES
 #include <SDL2/SDL.h>
 #include <GLES3/gl3.h>

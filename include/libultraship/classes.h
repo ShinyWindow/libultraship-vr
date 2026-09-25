@@ -34,4 +34,7 @@
 #ifdef __APPLE__
 #include "ship/utils/AppleFolderManager.h"
 #endif
+#ifdef __SWITCH__
+#include "ship/port/switch/SwitchImpl.h"
+#endif
 #endif
