@@ -234,6 +234,20 @@ inline Q4 q_integrate(const Q4& q, const V3& omega, float dt) {
     return qnorm({ q.x + 0.5f * dt * dq.x, q.y + 0.5f * dt * dq.y, q.z + 0.5f * dt * dq.z,
                    q.w + 0.5f * dt * dq.w });
 }
+// Shortest-arc rotation taking unit vector a onto unit vector b.
+inline Q4 q_from_to(const V3& a, const V3& b) {
+    const float d = vdot(a, b);
+    if (d < -0.9999f) { // antiparallel: half turn about any axis perpendicular to a
+        V3 axis = vcross(a, { 1.0f, 0.0f, 0.0f });
+        if (len(axis) < 1e-3f) {
+            axis = vcross(a, { 0.0f, 1.0f, 0.0f });
+        }
+        axis = mul(axis, 1.0f / len(axis));
+        return { axis.x, axis.y, axis.z, 0.0f };
+    }
+    const V3 c = vcross(a, b);
+    return qnorm({ c.x, c.y, c.z, 1.0f + d });
+}
 
 // --------------------------------------------------------------------------
 // State
@@ -308,6 +322,9 @@ struct SlotState {
     // Physics never sees it: contacts, the blade ring and every solver read use sl.quat.
     V3 vis_off;
     V3 vis_off_vel;
+    // Two-handed this step: the secondary hand is tracked and far enough from the grip for the
+    // line between the hands to define an aim. Gates the served off-hand pose and its haptics.
+    bool two_hand;
     // Contact + output state
     bool in_contact;
     bool passthrough; // fast-swing state: contacts disengaged until the swing slows down
@@ -682,11 +699,45 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
             continue;
         }
         const V3 target_pos = h.prev_pos_m; // latest raw sample
-        const Q4 target_quat = h.pend_quat.w == 0.0f && h.pend_quat.x == 0.0f && h.pend_quat.y == 0.0f &&
-                                       h.pend_quat.z == 0.0f
-                                   ? kQIdent
-                                   : h.pend_quat;
+        Q4 target_quat = h.pend_quat.w == 0.0f && h.pend_quat.x == 0.0f && h.pend_quat.y == 0.0f &&
+                                 h.pend_quat.z == 0.0f
+                             ? kQIdent
+                             : qnorm(h.pend_quat);
         const V3 target_vel = h.pend_vel_valid ? h.pend_lin_vel : h.fallback_vel;
+        // Angular velocity the target is moving with — the damping term matches it, and the
+        // pass-through speed and weight lag read it. One-handed that is the wrist's own.
+        V3 target_ang_vel = h.pend_ang_vel;
+
+        // ---- Two-handed aim ----
+        // The primary grip stays nailed to its hand; the object is re-aimed so the secondary grip
+        // point lies along the line between the hands. Only the handle DIRECTION comes from the
+        // second hand — the roll about the handle stays with the primary wrist, so twisting the
+        // lead hand still turns the head. The target's angular velocity is assembled the same way
+        // from the runtime's smooth hand velocities (never finite-differenced positions, which
+        // would amplify tracking noise across the short span between the hands): the primary
+        // wrist's roll about the handle plus the handle's swing from the hands' relative motion.
+        sl.two_hand = false;
+        {
+            const int hand2 = sl.desc.secondary_hand;
+            const V3 grip2_local = v3(sl.desc.grip_local_secondary_m);
+            const float grip2_len = len(grip2_local);
+            if (hand2 >= 0 && hand2 <= 1 && hand2 != hand && grip2_len > 0.02f) {
+                const HandState& h2 = g_hands[hand2];
+                const V3 span = sub(h2.prev_pos_m, target_pos);
+                const float span_len = len(span);
+                // Hands closer than a few cm give no usable aim: stay one-handed that step.
+                if (h2.have_prev && h2.steps_since_sample < kInactiveAfterSteps && span_len > 0.04f) {
+                    const V3 d_want = mul(span, 1.0f / span_len);
+                    const V3 d_cur = qrot(target_quat, mul(grip2_local, 1.0f / grip2_len));
+                    target_quat = qnorm(qmul(q_from_to(d_cur, d_want), target_quat));
+                    const V3 v2 = h2.pend_vel_valid ? h2.pend_lin_vel : h2.fallback_vel;
+                    const V3 swing = mul(vcross(d_want, sub(v2, target_vel)), 1.0f / span_len);
+                    const V3 roll = mul(d_want, vdot(h.pend_ang_vel, d_want));
+                    target_ang_vel = add(roll, swing);
+                    sl.two_hand = true;
+                }
+            }
+        }
 
         if (!sl.state_valid) { // activation: appear in the hand, not fly in from the origin
             sl.state_valid = true;
@@ -734,9 +785,22 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
         const float wa = kTwoPi * (sl.desc.ang_freq_hz > 0.1f ? sl.desc.ang_freq_hz : 0.1f);
         const float k_ang = wa * wa;
         const float c_ang = 2.0f * sl.desc.ang_zeta * wa;
+        // Gravity on the centre of mass, as a point mass at r: angular acceleration r x g / |r|^2.
+        // Raw tracking space is Y-up (the snap turn is a yaw), so g is -Y here. It enters the
+        // implicit update as an external acceleration: the spring settles where k * sag balances
+        // it, so the droop is gentle with a firm grip and pronounced with a soft one.
+        V3 grav_alpha = kV3Zero;
+        if (sl.desc.gravity_scale > 0.0f) {
+            const V3 com = qrot(sl.tgt_quat, v3(sl.desc.grip_local_com_m));
+            const float com2 = vdot(com, com);
+            if (com2 > 1e-4f) {
+                const V3 g = { 0.0f, -9.81f * sl.desc.gravity_scale, 0.0f };
+                grav_alpha = mul(vcross(com, g), 1.0f / com2);
+            }
+        }
         V3 twv = mul(add(add(sl.tgt_ang_vel_rps,
-                             mul(q_error_vec(qnorm(target_quat), sl.tgt_quat), dt_s * k_ang)),
-                         mul(h.pend_ang_vel, dt_s * c_ang)),
+                             mul(add(mul(q_error_vec(target_quat, sl.tgt_quat), k_ang), grav_alpha), dt_s)),
+                         mul(target_ang_vel, dt_s * c_ang)),
                      1.0f / (1.0f + dt_s * c_ang + dt_s * dt_s * k_ang));
         const float max_ang = sl.desc.max_ang_accel > 0.0f ? sl.desc.max_ang_accel : kMaxAngAccel;
         {
@@ -806,8 +870,8 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
         // own release) cuts through geometry instead of snagging; damage comes from the swept
         // quads either way. Hysteresis: re-engage only once the swing decays to 70%.
         if (sl.desc.passthrough_speed_mps > 0.0f && has_segment) {
-            const V3 mid_r = qrot(qnorm(target_quat), mul(add(root_local, tip_local), 0.5f));
-            const float sp = len(add(target_vel, vcross(h.pend_ang_vel, mid_r)));
+            const V3 mid_r = qrot(target_quat, mul(add(root_local, tip_local), 0.5f));
+            const float sp = len(add(target_vel, vcross(target_ang_vel, mid_r)));
             if (sl.passthrough) {
                 if (sp < sl.desc.passthrough_speed_mps * 0.7f) {
                     sl.passthrough = false;
@@ -859,9 +923,9 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
                 sl.pos_m = add(sl.tgt_pos_m, mul(sub(sl.pos_m, sl.tgt_pos_m), retention));
                 const V3 aerr = q_error_vec(sl.tgt_quat, sl.quat);
                 sl.quat = q_integrate(sl.quat, mul(aerr, 1.0f - retention), 1.0f);
-                if (g_haptic_count < kHapticCap) {
+                for (int hi = 0; hi < (sl.two_hand ? 2 : 1) && g_haptic_count < kHapticCap; hi++) {
                     VrPhysHapticReq& hr = g_haptics[g_haptic_count++];
-                    hr.hand = sl.desc.primary_hand;
+                    hr.hand = hi == 0 ? sl.desc.primary_hand : sl.desc.secondary_hand;
                     hr.amplitude01 = clamp01(0.2f + 0.5f * drag);
                     hr.freq_hz = 0.0f;
                     hr.duration_ms = 25.0f; // re-armed every step: reads as continuous
@@ -1245,7 +1309,7 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
         // blade ring and damage all live on sl.quat and never lag. At rest the offset decays
         // to exactly zero, so the sword stays parented to the hand.
         if (sl.desc.visual_lag_s > 0.0f) {
-            V3 tgt = mul(h.pend_ang_vel, -sl.desc.visual_lag_s);
+            V3 tgt = mul(target_ang_vel, -sl.desc.visual_lag_s);
             constexpr float kVisOffCap = 0.4f; // rad — a lag pose, not a detached sword
             const float tm = len(tgt);
             if (tm > kVisOffCap) {
@@ -1291,9 +1355,10 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
                     ev.impact_mps = max_impact;
                     ev.time_ns = g_last_time_ns;
                 }
-                if (g_haptic_count < kHapticCap) {
+                // Both hands feel it when both are on the handle.
+                for (int hi = 0; hi < (sl.two_hand ? 2 : 1) && g_haptic_count < kHapticCap; hi++) {
                     VrPhysHapticReq& hr = g_haptics[g_haptic_count++];
-                    hr.hand = sl.desc.primary_hand;
+                    hr.hand = hi == 0 ? sl.desc.primary_hand : sl.desc.secondary_hand;
                     hr.amplitude01 = clamp01(0.3f + max_impact * 0.18f);
                     hr.freq_hz = 0.0f;
                     hr.duration_ms = 30.0f + (max_impact > 4.0f ? 4.0f : max_impact) * 20.0f;
@@ -1327,6 +1392,8 @@ void vrphys_step(float dt_s, const float turn_quat_xyzw[4], const float turn_off
             v3_store(to_world_units(root, g_ctx), bs.root_units);
             v3_store(to_world_units(tip, g_ctx), bs.tip_units);
             v3_store(qrot(g_ctx.turn_rot, v_mid), bs.mid_vel_mps);
+            v3_store(to_world_units(sl.pos_m, g_ctx), bs.grip_units);
+            q4_store(qmul(g_ctx.turn_rot, sl.quat), bs.quat);
             bs.time_ns = g_last_time_ns;
             sl.blade_count++;
         }
@@ -1414,6 +1481,7 @@ void vrphys_set_object(int slot, const VrPhysObjectDesc* desc_or_null) {
         sl.active = false;
         sl.state_valid = false;
         sl.in_contact = false;
+        sl.two_hand = false;
         sl.blade_head = 0;
         sl.blade_count = 0;
         return;
@@ -1423,8 +1491,14 @@ void vrphys_set_object(int slot, const VrPhysObjectDesc* desc_or_null) {
     if (!sl.active) {
         sl.state_valid = false;
         sl.in_contact = false;
+        sl.two_hand = false;
         sl.blade_head = 0;
         sl.blade_count = 0;
+    }
+    // Letting go with the second hand hands the off hand back to its raw controller at once
+    // (the next step would clear it anyway; this closes the gap before that step).
+    if (desc_or_null->secondary_hand < 0) {
+        sl.two_hand = false;
     }
     sl.active = true;
     sl.desc = *desc_or_null;
@@ -1532,22 +1606,34 @@ int vrphys_get_object_contacts(int slot, float* out_pos_units_xyz, float* out_no
     return n;
 }
 
+// The rendered orientation of a slot: sl.quat plus the cosmetic weight lag, which rides ONLY the
+// served pose (rotation about the grip, raw frame) — physics stays on sl.quat.
+static Q4 served_quat(const SlotState& sl) {
+    const float om = len(sl.vis_off);
+    if (om > 1e-5f) {
+        const float half = om * 0.5f;
+        const float s = sinf(half) / om;
+        const Q4 offq = { sl.vis_off.x * s, sl.vis_off.y * s, sl.vis_off.z * s, cosf(half) };
+        return qnorm(qmul(offq, sl.quat));
+    }
+    return sl.quat;
+}
+
 bool vrphys_get_hand_sim_pose_raw(int hand, float out_pos_m[3], float out_quat_xyzw[4]) {
     for (const SlotState& sl : g_slots) {
         if (sl.active && sl.state_valid && sl.desc.primary_hand == hand) {
             v3_store(sl.pos_m, out_pos_m);
-            // Cosmetic weight lag rides ONLY this served pose (rotation about the grip, raw
-            // frame): the rendered sword trails and wiggles, physics stays on sl.quat.
-            const float om = len(sl.vis_off);
-            if (om > 1e-5f) {
-                const float half = om * 0.5f;
-                const float s = sinf(half) / om;
-                const Q4 offq = { sl.vis_off.x * s, sl.vis_off.y * s, sl.vis_off.z * s,
-                                  cosf(half) };
-                q4_store(qnorm(qmul(offq, sl.quat)), out_quat_xyzw);
-            } else {
-                q4_store(sl.quat, out_quat_xyzw);
-            }
+            q4_store(served_quat(sl), out_quat_xyzw);
+            return true;
+        }
+    }
+    // A two-handed hold also owns the SECOND hand's position: pinned to its grip point on the
+    // simulated handle, so Link's off hand holds the handle and lags with the object instead of
+    // floating at the raw controller. The wrist keeps its own tracked orientation.
+    for (const SlotState& sl : g_slots) {
+        if (sl.active && sl.state_valid && sl.two_hand && sl.desc.secondary_hand == hand) {
+            v3_store(add(sl.pos_m, qrot(served_quat(sl), v3(sl.desc.grip_local_secondary_m))), out_pos_m);
+            q4_store(qnorm(g_hands[hand].pend_quat), out_quat_xyzw);
             return true;
         }
     }

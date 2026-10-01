@@ -65,8 +65,8 @@ int vrphys_get_hand_path(int hand, VrPhysHandSample* out, int max_samples);
 // ---- Held-object simulation slots ----
 // One slot per concurrently-simulated held thing. A slot is active while it has a descriptor;
 // pass NULL to deactivate. On activation the object snaps to its hand target (no fly-in).
-// M0 scope: one-hand spring-damper toward the primary hand's grip pose, no contacts, no
-// two-hand solve — contact primitives and two-hand grips arrive with the blade-stop milestone.
+// Spring-damper toward the primary hand's grip pose (or, two-handed, that pose re-aimed along
+// the line between both hands), resolved against the pushed contact primitives.
 
 enum VrPhysSlotId {
     VRPHYS_SLOT_WEAPON = 0, // main-hand melee weapon
@@ -78,7 +78,7 @@ enum VrPhysSlotId {
 
 struct VrPhysObjectDesc {
     int primary_hand;           // 0 = left, 1 = right
-    int secondary_hand;         // -1 = one-handed (two-hand solve is a later milestone)
+    int secondary_hand;         // -1 = one-handed; else the hand gripping grip_local_secondary_m
     float lin_freq_hz;          // position spring natural frequency (14+ = near-1:1, 3-4 = heavy)
     float lin_zeta;             // position damping ratio (>= 1.0 keeps it overshoot-free)
     float ang_freq_hz;          // orientation spring natural frequency
@@ -110,6 +110,17 @@ struct VrPhysObjectDesc {
     // Physics, contacts and damage never lag; at rest the offset is exactly zero. <= 0 = off.
     float visual_lag_s;
     float visual_snap_hz; // catch-up spring frequency; <= 0.5 uses the built-in 5 Hz
+    // Two-handed hold (secondary_hand >= 0): where the second hand grips, in the PRIMARY grip's
+    // local frame (meters) — a point on the handle. The target orientation is re-aimed so the
+    // direction to this point follows the line between the two hands (roll about that line stays
+    // with the primary wrist), and the secondary hand's served pose is pinned to this point on
+    // the simulated object, so the rendered off hand holds the handle and lags with it.
+    float grip_local_secondary_m[3];
+    // Gravity on the object's centre of mass (grip-local meters): the orientation target sags
+    // under it against the angular spring, so a heavy head droops in a loose grip. Scale 0 = off,
+    // 1 = real g. Only the collision-free target sees it; contacts are unaffected.
+    float grip_local_com_m[3];
+    float gravity_scale;
 };
 
 void vrphys_set_object(int slot, const VrPhysObjectDesc* desc_or_null);
@@ -180,6 +191,9 @@ struct VrPhysBladeSample {
     float root_units[3];  // world units
     float tip_units[3];   // world units
     float mid_vel_mps[3]; // sim velocity of the blade midpoint, game-facing frame, m/s
+    float grip_units[3];  // sim grip position, world units
+    float quat[4];        // sim orientation, game-facing frame (x,y,z,w) — with grip_units, lets
+                          //   the game rebuild ANY grip-local point at this sample
     uint64_t time_ns;
 };
 int vrphys_get_blade_path(int slot, VrPhysBladeSample* out, int max_samples); // drains

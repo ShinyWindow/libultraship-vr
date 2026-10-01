@@ -227,6 +227,9 @@ void VR_PhysSetObject(int slot, const VrHeldObjectDesc* descOrNull) {
     tmp.cut_drag_world = d.cutDragWorld;
     tmp.visual_lag_s = d.visualLagS;
     tmp.visual_snap_hz = d.visualSnapHz;
+    memcpy(tmp.grip_local_secondary_m, d.gripLocalSecondaryM, sizeof(float) * 3);
+    memcpy(tmp.grip_local_com_m, d.gripLocalComM, sizeof(float) * 3);
+    tmp.gravity_scale = d.gravityScale;
     vrphys_set_object(slot, &tmp);
 }
 
@@ -275,6 +278,8 @@ int32_t VR_PhysGetBladePath(int slot, VrBladeSample* out, int32_t maxSamples) {
             memcpy(out[total + i].root, tmp[i].root_units, sizeof(float) * 3);
             memcpy(out[total + i].tip, tmp[i].tip_units, sizeof(float) * 3);
             memcpy(out[total + i].midVelMps, tmp[i].mid_vel_mps, sizeof(float) * 3);
+            memcpy(out[total + i].gripPos, tmp[i].grip_units, sizeof(float) * 3);
+            memcpy(out[total + i].quat, tmp[i].quat, sizeof(float) * 4);
             out[total + i].timeNs = tmp[i].time_ns;
         }
         total += got;

@@ -120,7 +120,7 @@ bool     VR_GetHandMatrix(int hand, float out[4][4]);
 // Contract version of the physical-combat interface between the game and this library. Bump on any
 // breaking change to these types/functions; the game asserts equality at init so a stale submodule
 // build fails loudly instead of subtly misbehaving.
-#define VR_PHYS_INTERFACE_VERSION 14
+#define VR_PHYS_INTERFACE_VERSION 15
 int32_t VR_PhysGetInterfaceVersion(void);
 
 // Latest hand velocity: linear in physical meters/second (independent of world scale and Link's
@@ -196,6 +196,15 @@ typedef struct VrHeldObjectDesc {
                                // rotation by this many seconds on fast swings, then snaps back
                                // with a little overshoot. Physics/damage never lag. <= 0 = off.
     float visualSnapHz;        // catch-up spring frequency; <= 0.5 uses the built-in 5 Hz
+    // Two-handed hold (secondaryHand >= 0): the point on the handle the second hand grips, in the
+    // PRIMARY grip's local frame (meters). The object is re-aimed so that point follows the line
+    // between the hands (roll stays with the primary wrist), and the second hand's served pose —
+    // VR_GetHandPose/VR_GetHandMatrix, so Link's rendered off hand — is pinned onto it.
+    float gripLocalSecondaryM[3];
+    // Gravity on the centre of mass (grip-local meters): the orientation target sags under it
+    // against the angular spring, so a heavy head droops in a loose grip. 0 = off, 1 = real g.
+    float gripLocalComM[3];
+    float gravityScale;
 } VrHeldObjectDesc;
 void VR_PhysSetObject(int slot, const VrHeldObjectDesc* descOrNull);
 
@@ -235,6 +244,9 @@ typedef struct VrBladeSample {
     float root[3];      // world units
     float tip[3];       // world units
     float midVelMps[3]; // sim velocity of the blade midpoint, m/s (locomotion-free)
+    float gripPos[3];   // sim grip position, world units
+    float quat[4];      // sim orientation, game-facing frame (x,y,z,w): with gripPos, rebuilds any
+                        //   grip-local point at this sample (a hammer head's real cross-section)
     uint64_t timeNs;
 } VrBladeSample;
 int32_t VR_PhysGetBladePath(int slot, VrBladeSample* out, int32_t maxSamples);
