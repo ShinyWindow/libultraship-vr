@@ -351,6 +351,14 @@ void VR_RegisterHandChildMatrix(const void* mtx, int hand, const float* localMf1
     vr_register_hand_child_matrix(mtx, hand, localMf16);
 }
 
+void VR_RegisterHeadChildMatrix(const void* mtx, const float* localMf16) {
+    vr_register_head_child_matrix(mtx, localMf16);
+}
+
+bool VR_GetHeadMatrix(float out[4][4]) {
+    return vr_get_head_matrix(out);
+}
+
 void VR_ClearHandMatrices(void) {
     vr_clear_hand_matrices();
 }

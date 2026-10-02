@@ -753,7 +753,10 @@ bool vr_init() {
 
     // Default configuration
     xr.world_scale = 35.0f;
-    xr.near_clip = 10.0f;
+    // ~11 cm at the default scale. At 10 units the near plane reached past Link's wall radius
+    // (child 14, adult 18 from the eye at a wall), so pressing against a wall showed through it.
+    // Fog keeps its original near-10 depth curve via vr_get_fog_ndc_z.
+    xr.near_clip = 4.0f;
     xr.far_clip = 30000.0f;
 
     // Default the frame plan to "do everything"; the window layer overrides it per frame. Without
@@ -1857,6 +1860,17 @@ void vr_get_projection_matrix(int eye, float out[4][4]) {
     memcpy(out, xr.projection[eye], sizeof(float) * 16);
 }
 
+// Fog depth (z/w) for a stereo-pass vertex, from its clip-space 1/w alone. The game's fog
+// coefficients (gSPFogPosition) act on z/w, which depends on the near plane; VR fog was tuned
+// with the eye projection at near 10. Reproduce that near-10 z/w so moving the real near plane
+// closer leaves fog exactly as it was.
+void vr_get_fog_ndc_z_params(float* a, float* b) {
+    const float n = 10.0f;
+    const float f = xr.far_clip;
+    *a = (f + n) / (f - n);
+    *b = 2.0f * f * n / (f - n);
+}
+
 void vr_get_view_matrix(int eye, float out[4][4]) {
     const float (*v)[4] = xr.view[eye];
     if (!xr.anchor_initialized) {
@@ -2373,15 +2387,15 @@ bool vr_get_hand_matrix(int hand, float out[4][4]) {
     // the same orientation — an unreflected mesh attaches with the same rotation on either side.
     glm::vec3 calDeg(CVarGetFloat("gVrHandCalPitch", 88.0f), CVarGetFloat("gVrHandCalYaw", -100.0f),
                      CVarGetFloat("gVrHandCalRoll", 80.0f));
-    // Positional offset (game units) in the controller grip frame, so the hand mesh can be nudged
+    // Positional offset (real cm) in the controller grip frame, so the hand mesh can be nudged
     // to sit naturally on the controller; the conjugate reflects it (negate the mirror-axis component).
-    glm::vec3 off(CVarGetFloat("gVrHandOffX", 0.0f), CVarGetFloat("gVrHandOffY", 0.0f),
+    glm::vec3 off(CVarGetFloat("gVrHandOffX", 0.0f), CVarGetFloat("gVrHandOffY", 6.3f),
                   CVarGetFloat("gVrHandOffZ", 0.0f));
     if (hand == 0 && CVarGetInteger("gVrHandLOverride", 1)) {
         // Fully independent left-controller tuning (values used literally, no conjugation).
         calDeg = glm::vec3(CVarGetFloat("gVrHandLCalPitch", -149.0f), CVarGetFloat("gVrHandLCalYaw", 76.0f),
                            CVarGetFloat("gVrHandLCalRoll", 30.0f));
-        off = glm::vec3(CVarGetFloat("gVrHandLOffX", 0.0f), CVarGetFloat("gVrHandLOffY", 0.0f),
+        off = glm::vec3(CVarGetFloat("gVrHandLOffX", 0.0f), CVarGetFloat("gVrHandLOffY", 6.3f),
                         CVarGetFloat("gVrHandLOffZ", 0.0f));
     } else if (hand == 1 || !mirrored) {
         for (int k = 0; k < 3; k++) {
@@ -2389,6 +2403,9 @@ bool vr_get_hand_matrix(int hand, float out[4][4]) {
         }
         off[axis] = -off[axis];
     }
+    // The offsets are real centimetres (how the hand sits on the controller is about the player's
+    // grip, not the game world), so they hold at any world scale.
+    off *= 0.01f * xr.world_scale;
     glm::quat cal = glm::quat(calDeg * kDeg);
     // Mirror = reflect the chosen model-local axis to flip the hand's handedness (the game also
     // inverts back-face culling for it).
@@ -2442,9 +2459,76 @@ void vr_register_hand_child_matrix(const void* mtx, int hand, const float* local
     }
 }
 
+// The rendered head (center eye) in game-world coords, as a model matrix in the hand matrix's
+// layout: +X right, +Y up, -Z forward. Exactly the inverse of vr_get_view_matrix's anchoring
+// (interpolated anchor + gamma, this frame's located views), so geometry composed onto it holds
+// perfectly still in front of the eyes. false (+ identity) before the first located frame.
+bool vr_get_head_matrix(float out[4][4]) {
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+            out[r][c] = (r == c) ? 1.0f : 0.0f;
+    if (!xr.initialized) {
+        return false;
+    }
+    const XrQuaternionf& q0r = xr.views[0].pose.orientation;
+    const XrQuaternionf& q1r = xr.views[1].pose.orientation;
+    glm::quat q0(q0r.w, q0r.x, q0r.y, q0r.z);
+    glm::quat q1(q1r.w, q1r.x, q1r.y, q1r.z);
+    if (glm::dot(q0, q1) < 0.0f) q1 = -q1;
+    glm::quat q = q0 + q1;
+    const float qlen = glm::length(q);
+    if (qlen < 1e-6f) {
+        return false;
+    }
+    q *= (1.0f / qlen);
+    glm::vec3 pos = 0.5f * (glm::vec3(xr.views[0].pose.position.x, xr.views[0].pose.position.y,
+                                      xr.views[0].pose.position.z) +
+                            glm::vec3(xr.views[1].pose.position.x, xr.views[1].pose.position.y,
+                                      xr.views[1].pose.position.z));
+    pos *= xr.world_scale;
+    glm::vec3 anchor(0.0f);
+    float g = 0.0f;
+    if (xr.anchor_initialized) {
+        anchor = glm::mix(xr.anchor_prev, xr.anchor, xr.interp_alpha);
+        g = xr.anchor_gamma_prev + (xr.anchor_gamma - xr.anchor_gamma_prev) * xr.interp_alpha;
+    }
+    // Undo the view's RowRotY(gamma): v -> (x cg - z sg, y, x sg + z cg) (see vr_get_camera_pose).
+    const float cg = cosf(g), sg = sinf(g);
+    const glm::mat3 unyaw(glm::vec3(cg, 0.0f, sg), glm::vec3(0.0f, 1.0f, 0.0f), glm::vec3(-sg, 0.0f, cg));
+    const glm::mat4 m = glm::translate(glm::mat4(1.0f), anchor + unyaw * pos) * glm::mat4(unyaw * glm::mat3_cast(q));
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+            out[r][c] = m[r][c];
+    return true;
+}
+
+// Live head-CHILD matrices (a worn item, the Lens of Truth aperture): registered with a
+// head-LOCAL transform; lookup returns (rendered head) x (local) per eye, so the geometry is
+// glued to the face at render rate instead of trailing the head at game rate.
+static std::unordered_map<const void*, HandChildMtx> g_head_child_registry;
+
+void vr_register_head_child_matrix(const void* mtx, const float* local_mf16) {
+    if (mtx && local_mf16) {
+        HandChildMtx& e = g_head_child_registry[mtx];
+        e.hand = -1;
+        memcpy(e.local, local_mf16, sizeof(e.local));
+    }
+}
+
 void vr_clear_hand_matrices() {
     g_hand_mtx_registry.clear();
     g_hand_child_registry.clear();
+    g_head_child_registry.clear();
+}
+
+// out = parent COMPOSED WITH local (local applied to vertices first); MtxF [column][component].
+static void vr_compose_child(const float parent[4][4], const float local[4][4], float out[4][4]) {
+    for (int c = 0; c < 4; c++) {
+        for (int r = 0; r < 4; r++) {
+            out[c][r] = parent[0][r] * local[c][0] + parent[1][r] * local[c][1] + parent[2][r] * local[c][2] +
+                        parent[3][r] * local[c][3];
+        }
+    }
 }
 
 bool vr_lookup_hand_matrix(const void* mtx, float out[4][4]) {
@@ -2464,15 +2548,18 @@ bool vr_lookup_hand_matrix(const void* mtx, float out[4][4]) {
             if (!vr_get_hand_matrix(it->second.hand, hm)) {
                 return false;
             }
-            const float(*l)[4] = it->second.local;
-            // out = hand COMPOSED WITH local (local applied to vertices first). All three
-            // matrices share the MtxF [column][component] layout.
-            for (int c = 0; c < 4; c++) {
-                for (int r = 0; r < 4; r++) {
-                    out[c][r] =
-                        hm[0][r] * l[c][0] + hm[1][r] * l[c][1] + hm[2][r] * l[c][2] + hm[3][r] * l[c][3];
-                }
+            vr_compose_child(hm, it->second.local, out);
+            return true;
+        }
+    }
+    if (!g_head_child_registry.empty()) {
+        auto it = g_head_child_registry.find(mtx);
+        if (it != g_head_child_registry.end()) {
+            float head[4][4];
+            if (!vr_get_head_matrix(head)) {
+                return false;
             }
+            vr_compose_child(head, it->second.local, out);
             return true;
         }
     }
@@ -2739,6 +2826,7 @@ void vr_get_frame_stats(struct VrFrameStats* out) {
 void vr_begin_eye(int) {}
 void vr_end_eye(int) {}
 void vr_get_projection_matrix(int, float out[4][4]) { memset(out, 0, sizeof(float) * 16); }
+void vr_get_fog_ndc_z_params(float* a, float* b) { *a = *b = 0.0f; }
 void vr_get_view_matrix(int, float out[4][4]) { memset(out, 0, sizeof(float) * 16); }
 bool vr_is_initialized() { return false; }
 int vr_get_current_eye() { return 0; }
@@ -2792,6 +2880,13 @@ void vr_set_hand_mirror(int, bool) {}
 void vr_trigger_haptic(int, float, float, float) {}
 void vr_register_hand_matrix(const void*, int) {}
 void vr_register_hand_child_matrix(const void*, int, const float*) {}
+bool vr_get_head_matrix(float out[4][4]) {
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+            out[r][c] = (r == c) ? 1.0f : 0.0f;
+    return false;
+}
+void vr_register_head_child_matrix(const void*, const float*) {}
 void vr_clear_hand_matrices() {}
 bool vr_lookup_hand_matrix(const void*, float out[4][4]) {
     for (int r = 0; r < 4; r++)

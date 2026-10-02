@@ -1574,6 +1574,13 @@ void Interpreter::AdjustWidthHeightForScale(uint32_t& width, uint32_t& height, u
 }
 
 void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices) {
+    // SOH [VR] Stereo passes take fog depth from a fixed near-10 curve rather than the eye
+    // projection's z, so the eye's near plane can move without changing fog.
+    const bool vr_fog = vr_is_initialized() && !vr_is_rendering_hud();
+    float vr_fog_a = 0.0f, vr_fog_b = 0.0f;
+    if (vr_fog) {
+        vr_get_fog_ndc_z_params(&vr_fog_a, &vr_fog_b);
+    }
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
         const F3DVtx_t* v = &vertices[i].v;
         const F3DVtx_tn* vn = &vertices[i].n;
@@ -1755,7 +1762,8 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                 winv = std::numeric_limits<int16_t>::max();
             }
 
-            float fog_z = z * winv * mRsp->fog_mul + mRsp->fog_offset;
+            const float ndc_z = vr_fog ? vr_fog_a - vr_fog_b * winv : z * winv;
+            float fog_z = ndc_z * mRsp->fog_mul + mRsp->fog_offset;
             fog_z = Ship::Math::clamp(fog_z, 0.0f, 255.0f);
             d->color.a = fog_z; // Use alpha variable to store fog factor
         } else {

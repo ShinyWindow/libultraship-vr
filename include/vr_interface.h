@@ -290,6 +290,11 @@ void     VR_RegisterHandMatrix(const void* mtx, int hand);
 // A matrix DERIVED from a hand at 20 Hz (bow/slingshot string): substituted per frame with
 // (live hand pose) x (localMf16, MtxF layout), so it stays welded to the live-rendered hand.
 void     VR_RegisterHandChildMatrix(const void* mtx, int hand, const float* localMf16);
+// The head's counterpart for worn items (Lens of Truth): substituted per frame with (rendered head) x
+// (localMf16), where the head frame is the center eye: +X right, +Y up, -Z forward, game units.
+// VR_GetHeadMatrix = that rendered head right now (game-world, MtxF layout), for a 20 Hz fallback.
+void     VR_RegisterHeadChildMatrix(const void* mtx, const float* localMf16);
+bool     VR_GetHeadMatrix(float out[4][4]);
 void     VR_ClearHandMatrices(void);
 
 #ifdef __cplusplus

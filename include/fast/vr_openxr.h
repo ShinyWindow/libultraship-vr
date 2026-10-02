@@ -57,6 +57,9 @@ void vr_end_eye(int eye);
 // Matrix queries (used by gfx_pc.cpp matrix injection)
 void vr_get_projection_matrix(int eye, float out[4][4]);
 void vr_get_view_matrix(int eye, float out[4][4]);
+// Fog z/w as a near-10 eye projection would produce it: z/w = a - b * (1/w). Keeps fog independent
+// of the real near plane.
+void vr_get_fog_ndc_z_params(float* a, float* b);
 
 // State queries
 bool vr_is_initialized();
@@ -99,8 +102,8 @@ void vr_get_roomscale_desired(float out[2]);
 void vr_add_roomscale_displacement(float dx, float dz);
 void vr_get_roomscale_origin(float out[2]);
 void vr_reset_roomscale();
-// Bound how far the camera may sit from Link's body horizontally (comfort + keeps the controller-
-// driven camera within Link's collision; only physical lean uses this slack). <= 0 disables.
+// Bound how far the camera may sit from Link's body horizontally; first person passes the body-move
+// deadzone, so physical motion the body couldn't follow is discarded. <= 0 disables.
 void vr_clamp_roomscale_lean(float max_units);
 
 // Motion controls (OpenXR action sets). hand: 0 = left, 1 = right. Hand poses are in game-world
@@ -136,6 +139,11 @@ void vr_register_hand_matrix(const void* mtx, int hand);
 // Hand-CHILD matrix: substituted with (live hand pose) x (local_mf16, MtxF layout) — for
 // geometry derived from the hand at 20 Hz that must track the live hand (bowstring).
 void vr_register_hand_child_matrix(const void* mtx, int hand, const float* local_mf16);
+// The rendered center-eye pose as a model matrix (same layout; +X right, +Y up, -Z forward), and the
+// head-CHILD registry: substituted with (rendered head) x (local_mf16) per eye — worn items. Cleared
+// with the hand registries.
+bool vr_get_head_matrix(float out[4][4]);
+void vr_register_head_child_matrix(const void* mtx, const float* local_mf16);
 void vr_clear_hand_matrices();
 bool vr_lookup_hand_matrix(const void* mtx, float out[4][4]);
 
