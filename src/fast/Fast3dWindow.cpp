@@ -313,6 +313,16 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
                 hudMs = elapsedMsSince(hudStart);
             }
 
+            // Text panel (message system on its own soft-follow quad), same once-per-tick cadence.
+            Gfx* textCommands = static_cast<Gfx*>(vr_get_text_commands());
+            if (textCommands != nullptr && renderHud) {
+                const auto textStart = std::chrono::steady_clock::now();
+                vr_begin_text();
+                mInterpreter->Run(textCommands, mtxReplacements);
+                vr_end_text();
+                hudMs += elapsedMsSince(textStart);
+            }
+
             vr_end_frame();
         }
 

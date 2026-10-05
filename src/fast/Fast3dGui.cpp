@@ -1,6 +1,7 @@
 #include "fast/Fast3dGui.h"
 
 #include "fast/Fast3dWindow.h"
+#include "fast/vr_openxr.h"
 #include "ship/Context.h"
 #include "ship/config/ConsoleVariable.h"
 #include "fast/backends/gfx_metal.h"
@@ -418,6 +419,41 @@ void Fast3dGui::DrawGame() {
     if (fb) {
         ImGui::SetCursorPos(pos);
         ImGui::Image(reinterpret_cast<ImTextureID>(fb), size);
+
+        // SOH [VR] The game image is the left-eye mirror, which never contains the headset's quad
+        // layers (HUD / wrist panels, text panel, menu panel): the runtime composites those. Draw
+        // each one over the mirror exactly where that eye sees it, as a grid of small image quads
+        // so the perspective holds (ImGui maps textures affinely per quad).
+        if (vr_is_initialized()) {
+            static VrMirrorQuad sQuads[8];
+            const int count = vr_get_mirror_quads(sQuads, 8);
+            if (count > 0) {
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                const ImVec2 wp = ImGui::GetWindowPos();
+                const float ox = wp.x + pos.x, oy = wp.y + pos.y;
+                const int g = VR_MIRROR_GRID;
+                for (int k = 0; k < count; k++) {
+                    const VrMirrorQuad& q = sQuads[k];
+                    auto P = [&](int ix, int iy) {
+                        return ImVec2(ox + q.pt[ix][iy][0] * size.x, oy + q.pt[ix][iy][1] * size.y);
+                    };
+                    auto UV = [&](int ix, int iy) {
+                        return ImVec2(q.uv[0] + (q.uv[2] - q.uv[0]) * ix / (g - 1),
+                                      q.uv[1] + (q.uv[3] - q.uv[1]) * iy / (g - 1));
+                    };
+                    for (int ix = 0; ix < g - 1; ix++) {
+                        for (int iy = 0; iy < g - 1; iy++) {
+                            if (!q.ok[ix][iy] || !q.ok[ix + 1][iy] || !q.ok[ix + 1][iy + 1] || !q.ok[ix][iy + 1]) {
+                                continue;
+                            }
+                            dl->AddImageQuad(reinterpret_cast<ImTextureID>(q.srv), P(ix, iy), P(ix + 1, iy),
+                                             P(ix + 1, iy + 1), P(ix, iy + 1), UV(ix, iy), UV(ix + 1, iy),
+                                             UV(ix + 1, iy + 1), UV(ix, iy + 1));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     ImGui::End();

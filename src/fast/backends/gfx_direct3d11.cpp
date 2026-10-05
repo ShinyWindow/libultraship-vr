@@ -516,6 +516,17 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
 
     ThrowIfFailed(mDevice->CreateBlendState(&blend_desc, prg->blend_state.GetAddressOf()));
 
+    // SOH [VR] The VR HUD and text quads are cleared to transparent and composited by alpha. Keeping the
+    // destination alpha (above) leaves every translucent draw at alpha 0 there, so the compositor
+    // ADDS its colour onto the world: the black dialogue box vanished entirely, the brown sign board
+    // showed as a faint glow. Standard "over" on alpha makes the target premultiplied, which is
+    // what an XR quad layer without the unpremultiplied flag expects.
+    if (cc_features.opt_alpha) {
+        blend_desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+        blend_desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+        ThrowIfFailed(mDevice->CreateBlendState(&blend_desc, prg->blend_state_coverage.GetAddressOf()));
+    }
+
     // Save some values
 
     prg->shader_id0 = shader_id0;
@@ -821,11 +832,17 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         mContext->IASetInputLayout(mShaderProgram->input_layout.Get());
         mContext->VSSetShader(mShaderProgram->vertex_shader.Get(), 0, 0);
         mContext->PSSetShader(mShaderProgram->pixel_shader.Get(), 0, 0);
+    }
 
-        if (mLastBlendState.Get() != mShaderProgram->blend_state.Get()) {
-            mLastBlendState = mShaderProgram->blend_state.Get();
-            mContext->OMSetBlendState(mShaderProgram->blend_state.Get(), 0, 0xFFFFFFFF);
-        }
+    // Checked per draw, not per program switch: the same program draws into the eyes and the
+    // HUD/text quads within one frame.
+    ID3D11BlendState* blend = mShaderProgram->blend_state.Get();
+    if (mShaderProgram->blend_state_coverage && vr_wants_coverage_blend()) {
+        blend = mShaderProgram->blend_state_coverage.Get();
+    }
+    if (mLastBlendState.Get() != blend) {
+        mLastBlendState = blend;
+        mContext->OMSetBlendState(blend, 0, 0xFFFFFFFF);
     }
 
     if (mLastPrimitaveTopology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST) {

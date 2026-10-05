@@ -469,7 +469,7 @@ class Interpreter {
     void GfxDpSetFogColor(uint8_t r, uint8_t g, uint8_t b, uint8_t a);
     void GfxDpSetBlendColor(uint8_t r, uint8_t g, uint8_t b, uint8_t a);
     void GfxDpSetFillColor(uint32_t pickedColor);
-    void GfxDrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry);
+    void GfxDrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry, bool textured = false);
     void GfxDpTextureRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry, uint8_t tile, int16_t uls,
                                int16_t ult, int16_t dsdx, int16_t dtdy, bool flip);
     void GfxDpImageRectangle(int32_t tile, int32_t w, int32_t h, int32_t ulx, int32_t uly, int16_t uls, int16_t ult,

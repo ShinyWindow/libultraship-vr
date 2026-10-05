@@ -119,6 +119,14 @@ void vr_get_thumbstick(int hand, float* x, float* y);
 // Modal hand gestures (Alyx-style item selector): while suppressed, this hand's thumbstick
 // reads centered at the source — movement, turning and stick C-buttons all inherit it.
 void vr_set_stick_suppressed(int hand, bool suppressed);
+// Artificial turning (snap/smooth) off while a stereo game menu owns the right stick.
+void vr_set_turn_suppressed(bool suppressed);
+// Physical climbing: see VR_SetClimbViewLock / VR_GetHandTracked (vr_interface.h).
+void vr_set_climb_view_lock(int hand, const float ref_units[3], const float wall_normal[3], bool lateral);
+bool vr_get_hand_tracked(int hand, float out_units[3]);
+void vr_request_face_yaw(int16_t yaw_binang);
+void vr_set_climb_view_limits(const float wall_out[3], const float lo[3], const float hi[3]);
+bool vr_consume_climb_discontinuity();
 float vr_get_trigger(int hand);
 float vr_get_grip(int hand);
 // One-shot controller vibration through the OpenXR haptic action. amplitude 0..1, freq_hz <= 0 =
@@ -158,6 +166,10 @@ void vr_set_interp_alpha(float alpha);
 
 // Render target rebind (called when sub-framebuffer operations restore the main target)
 void vr_rebind_current_eye_target();
+// Clear the depth of the eye image currently being rendered (stereo passes only). The interpreter
+// calls it for a full-screen Z fill issued mid-list: a game resetting depth for content that must
+// not be occluded by the world (the world-space pause menu's 3D Link).
+void vr_clear_current_eye_depth();
 
 // HUD overlay (rendered to a separate quad layer in front of the user)
 void vr_set_hud_commands(void* commands);
@@ -166,6 +178,36 @@ void vr_begin_hud();
 void vr_end_hud();
 bool vr_is_rendering_hud();
 bool vr_is_rendering_screen();
+
+// Text panel: the message system's display list (text boxes, ocarina staff) on its own quad that
+// soft-follows in front of the player in real metres. commands NULL = no text box showing (panel
+// hidden; the next non-NULL snaps it into place). crop = u0, v0, u1, v1 of the 320x240 frame to
+// show. Rendered once per frame like the HUD, as a 2D pass (vr_is_rendering_hud() is true).
+void vr_set_text_commands(void* commands, const float crop[4]);
+void* vr_get_text_commands();
+void vr_begin_text();
+void vr_end_text();
+bool vr_is_rendering_text();
+// A 2D pass into a transparent quad target (HUD or text): the backend accumulates alpha coverage.
+bool vr_wants_coverage_blend();
+
+// HUD elements (see VR_HUD_MARKER in vr_interface.h). g_vr_hud_layout_pass is true only during a
+// HUD pass that filters/lays out elements (wrist layout, or the world-space pause frame); the
+// interpreter then asks vr_hud_tri, per triangle, whether to draw it, and gets { s, ox, oy }:
+// clip-space x' = s x + ox w, y' = s y + oy w moves and sizes it into its slot (identity on the
+// pause frame). A plain global so the per-triangle check costs a load when it's off.
+extern bool g_vr_hud_layout_pass;
+void vr_hud_marker(uint32_t w1);
+bool vr_hud_tri(const float ndc_xy[6], float out_scale_offset[3]);
+// Link's age, for the Adult / Child wrist HUD settings profile (vr_hud_settings.h).
+void vr_set_hud_child(bool child);
+bool vr_get_hud_child();
+// World-anchored HUD quad (world-space pause): see VR_SetHudWorldPanel.
+void vr_set_hud_world_panel(bool enabled, const float center[3], float yaw, float width, float height);
+// Texture rectangles in stereo passes (world-space file select): see VR_SetRectWorldPanel. Plain
+// globals so the per-rect check costs a load when it's off.
+extern bool g_vr_rect_world;
+extern float g_vr_rect_world_mtx[4][4];
 
 // Flat-screen mode: 2D contexts (file select, pause) render the whole frame to a world-locked
 // floating panel instead of the stereo eyes; the frozen world stays behind it, still head-tracked.
@@ -182,3 +224,16 @@ void vr_get_2d_target_size(uint32_t* w, uint32_t* h);
 // mirror isn't available.
 void vr_capture_mirror();
 void* vr_get_mirror_texture_id();
+
+// The headset's quad layers (HUD / wrist panels, text panel, flat-screen panel, pause HUD frame)
+// as the mirrored left eye sees them, for the companion window to draw over the mirror: each quad
+// is a VR_MIRROR_GRID^2 grid of points in 0..1 mirror-image coordinates (ok = in front of the eye)
+// plus its texture (an ImTextureID) and UV rect (u0, v0, u1, v1). Returns how many were filled.
+#define VR_MIRROR_GRID 9
+struct VrMirrorQuad {
+    void* srv;
+    float uv[4];
+    float pt[VR_MIRROR_GRID][VR_MIRROR_GRID][2];
+    bool ok[VR_MIRROR_GRID][VR_MIRROR_GRID];
+};
+int vr_get_mirror_quads(VrMirrorQuad* out, int max);

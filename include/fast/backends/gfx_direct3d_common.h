@@ -59,6 +59,10 @@ struct ShaderProgramD3D11 {
     Microsoft::WRL::ComPtr<ID3D11PixelShader> pixel_shader;
     Microsoft::WRL::ComPtr<ID3D11InputLayout> input_layout;
     Microsoft::WRL::ComPtr<ID3D11BlendState> blend_state;
+    // SOH [VR] Same colour blend, but alpha accumulates coverage ("over") instead of being kept.
+    // Used on transparent VR quad targets (text panel), where the compositor reads alpha; null when
+    // the program doesn't blend.
+    Microsoft::WRL::ComPtr<ID3D11BlendState> blend_state_coverage;
 
     uint64_t shader_id0;
     uint64_t shader_id1;

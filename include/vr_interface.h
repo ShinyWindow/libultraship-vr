@@ -12,6 +12,62 @@ bool VR_IsInitialized();
 // BEFORE building the tick's display list, so a DL built for one mode is never drawn in the other.
 void VR_ApplyModeRequest(void);
 void VR_SetOverlayDisplayList(void* commands);
+// The message system's own display list (text boxes, signs, item text, the ocarina staff), shown
+// on a separate quad that soft-follows in front of the player — never on the HUD quad. The game
+// sets it every tick: a self-contained list while a text box is showing, NULL otherwise (and in
+// flat-screen contexts, where text stays in the overlay). (u0,v0)-(u1,v1) is the part of the
+// 320x240 frame the panel shows (the text box, plus the staff while the ocarina is out).
+void VR_SetTextDisplayList(void* commands, float u0, float v0, float u1, float v1);
+
+// HUD elements. The game tags the overlay list with marker commands (the G_VRPHYS_MASK opcode with
+// w1 = VR_HUD_MARKER(element, alpha)); everything after a marker belongs to that element until the
+// next one (an element may be tagged in several places, e.g. a button's circle and later its icon).
+// With the wrist layout every element is lifted off its screen position and laid out on its own
+// hand's canvas (vitals on the LEFT controller, buttons and minimap on the RIGHT: physical hands,
+// not handedness), so the wrists get a layout designed for them instead of a slice of the TV one.
+// alpha (0-255) is the element's vanilla fade. NONE/OTHER never go on a wrist.
+#define VR_HUD_EL_NONE 0
+#define VR_HUD_EL_OTHER 1    // enemy bar, lock-on fallback, lineup tick, screen fill
+#define VR_HUD_EL_PAUSE_FX 2 // pause equip fly-in (inventory slot -> C button)
+#define VR_HUD_EL_HEARTS 3
+#define VR_HUD_EL_MAGIC 4
+#define VR_HUD_EL_RUPEES 5
+#define VR_HUD_EL_KEYS 6
+#define VR_HUD_EL_TIMER 7         // clock + countdown (hot rooms, races, ...)
+#define VR_HUD_EL_GAME_TIMER 8    // SoH total gameplay timer
+#define VR_HUD_EL_BTN_B 9         // circle, item + ammo, or its action label
+#define VR_HUD_EL_BTN_A 10        // A button + action label
+#define VR_HUD_EL_BTN_C_LEFT 11
+#define VR_HUD_EL_BTN_C_DOWN 12
+#define VR_HUD_EL_BTN_C_RIGHT 13
+#define VR_HUD_EL_BTN_C_UP 14     // Navi prompt
+#define VR_HUD_EL_BTN_DPAD 15     // SoH D-pad items
+#define VR_HUD_EL_BTN_START 16    // pause only
+#define VR_HUD_EL_MOUNT 17        // Epona's carrots / horseback archery score
+#define VR_HUD_EL_MINIMAP 18
+#define VR_HUD_EL_COUNT 19
+#define VR_HUD_MARKER(element, alpha) (0x100u | ((unsigned)(element) & 0xFFu) | (((unsigned)(alpha) & 0xFFu) << 16))
+// Link's age, pushed by the game with the HUD each tick: the wrist HUD has separate Adult and
+// Child layout profiles (fast/vr_hud_settings.h).
+void VR_SetHudChild(int32_t child);
+
+// World-anchored HUD for the world-space pause menu: while enabled, the HUD (vitals, buttons with
+// their Return / Save / Decide labels, the equip fly-in) is drawn at its TV positions on one quad in the
+// world instead of on the wrists, so it frames the front page the way the flat menu frames it.
+// center = quad centre in game-world units, yaw = its facing in radians (Matrix_RotateY
+// convention: the quad's face points along RotateY(yaw) * +Z), width/height in game units. The
+// library converts it to tracking space every frame (world scale, anchor, artificial turn).
+void VR_SetHudWorldPanel(int32_t enabled, const float center[3], float yaw, float width, float height);
+
+// Screen-space texture rectangles in a STEREO pass (a 2D game state drawn in the world: the
+// world-space file select). Without this a texrect covers the eye's own NDC, i.e. it is welded to
+// each eye across the whole headset FOV. While enabled, a textured rect's corners are mapped
+// through mtx (game MtxF layout, row vectors, translation in [3]): rect NDC (x, y, 0, 1), with
+// x, y in [-1, 1] spanning the 320x240 frame, goes to game-world units and then through the eye's
+// view x projection, so the rect lands on a virtual TV screen in the world. Fill rectangles
+// (clears, screen fades) stay full-eye. 2D passes (HUD, text, flat panel) are unaffected.
+// The game sets it every frame (enabled = 0 turns it off).
+void VR_SetRectWorldPanel(int32_t enabled, const float mtx[16]);
 
 // Bracket the game's fixed-timestep logic update so the VR performance readout can separate it
 // from render cost. Game logic runs once per 20 Hz tick on the same thread as the render passes,
@@ -104,6 +160,31 @@ bool     VR_GetHandPose(int hand, float pos[3], float quat[4]);
 // reads as centered at the SOURCE — movement, artificial turning and stick C-buttons all
 // inherit it, so holding a stick-click gesture can't steer, turn or fire items.
 void     VR_SetStickSuppressed(int hand, int32_t suppressed);
+// Artificial turning (snap/smooth) off while set: a game menu rendered in stereo (the world-space
+// pause menu) owns the right stick as its C-stick. The stick itself still reads normally.
+void     VR_SetTurnSuppressed(int32_t suppressed);
+// Physical climbing. VR_GetHandTracked: the controller grip position relative to the playspace
+// anchor, in game units (world-facing, artificial turn applied) — VR_GetHandPose minus the anchor,
+// i.e. pure arm/body tracking with no locomotion in it; deltas of it are what the climber's arm did.
+// False while the controller's position isn't actually tracked (IMU-only drift).
+// VR_SetClimbViewLock(hand, ref, wallNormal, lateral): while hand is 0/1 the camera anchor (and so
+// every hand, quad and sim pose) is the game's latest anchor minus the hand's tracked motion since
+// ref (the VR_GetHandTracked value the game moved the body by this tick), with the component along
+// wallNormal removed and, unless lateral, the horizontal part too. The gripping hand stays where it
+// took hold and the view follows the arm at headset rate instead of a 20 Hz tick behind it.
+// hand -1 (or ref NULL) = off, back to the interpolated anchor. Turning must be suppressed while on.
+bool     VR_GetHandTracked(int hand, float outUnits[3]);
+void     VR_SetClimbViewLock(int32_t hand, const float refUnits[3], const float wallNormal[3], int32_t lateral);
+// While locked: how far (units, >= 0) the body can still move this tick, along the wall (x: toward
+// +t = (-out.z, 0, out.x)), up (y) and out from it (z), lo = the negative directions, hi = the
+// positive ones. The view's between-tick motion is clamped to them. NULL = unlimited.
+void     VR_SetClimbViewLimits(const float wallOut[3], const float lo[3], const float hi[3]);
+// True once after the gripping hand lost tracking, jumped, or the system recentered while locked:
+// the view held still meanwhile; the game re-bases its reference instead of moving the body.
+bool     VR_ConsumeClimbDiscontinuity(void);
+// Turn the player (an instant artificial turn about the head, like a snap turn) so their heading
+// becomes this game yaw (binang). One-shot: applied on the next frame. First person only.
+void     VR_RequestFaceYaw(int16_t yawBinang);
 // Controller aim ray (runtime-calibrated pointing pose) in game-world coords: origin + unit
 // forward direction. This is the ray for weapon aiming (slingshot/bow/hookshot).
 bool     VR_GetAimRay(int hand, float pos[3], float dir[3]);
@@ -120,7 +201,7 @@ bool     VR_GetHandMatrix(int hand, float out[4][4]);
 // Contract version of the physical-combat interface between the game and this library. Bump on any
 // breaking change to these types/functions; the game asserts equality at init so a stale submodule
 // build fails loudly instead of subtly misbehaving.
-#define VR_PHYS_INTERFACE_VERSION 15
+#define VR_PHYS_INTERFACE_VERSION 16
 int32_t VR_PhysGetInterfaceVersion(void);
 
 // Latest hand velocity: linear in physical meters/second (independent of world scale and Link's

@@ -44,6 +44,26 @@ void VR_SetOverlayDisplayList(void* commands) {
     vr_set_hud_commands(commands);
 }
 
+void VR_SetHudChild(int32_t child) {
+    vr_set_hud_child(child != 0);
+}
+
+void VR_SetHudWorldPanel(int32_t enabled, const float center[3], float yaw, float width, float height) {
+    vr_set_hud_world_panel(enabled != 0, center, yaw, width, height);
+}
+
+void VR_SetRectWorldPanel(int32_t enabled, const float mtx[16]) {
+    g_vr_rect_world = (enabled != 0) && (mtx != nullptr);
+    if (g_vr_rect_world) {
+        memcpy(g_vr_rect_world_mtx, mtx, sizeof(g_vr_rect_world_mtx));
+    }
+}
+
+void VR_SetTextDisplayList(void* commands, float u0, float v0, float u1, float v1) {
+    const float crop[4] = { u0, v0, u1, v1 };
+    vr_set_text_commands(commands, crop);
+}
+
 void VR_SetLinkEyeHeight(float units) {
     vr_set_link_eye_height(units);
 }
@@ -134,6 +154,30 @@ void VR_GetThumbstick(int hand, float* x, float* y) {
 
 void VR_SetStickSuppressed(int hand, int32_t suppressed) {
     vr_set_stick_suppressed(hand, suppressed != 0);
+}
+
+void VR_SetTurnSuppressed(int32_t suppressed) {
+    vr_set_turn_suppressed(suppressed != 0);
+}
+
+bool VR_GetHandTracked(int hand, float outUnits[3]) {
+    return vr_get_hand_tracked(hand, outUnits);
+}
+
+void VR_SetClimbViewLock(int32_t hand, const float refUnits[3], const float wallNormal[3], int32_t lateral) {
+    vr_set_climb_view_lock(hand, refUnits, wallNormal, lateral != 0);
+}
+
+void VR_SetClimbViewLimits(const float wallOut[3], const float lo[3], const float hi[3]) {
+    vr_set_climb_view_limits(wallOut, lo, hi);
+}
+
+bool VR_ConsumeClimbDiscontinuity(void) {
+    return vr_consume_climb_discontinuity();
+}
+
+void VR_RequestFaceYaw(int16_t yawBinang) {
+    vr_request_face_yaw(yawBinang);
 }
 
 float VR_GetTrigger(int hand) {

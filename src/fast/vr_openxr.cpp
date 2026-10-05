@@ -1,9 +1,17 @@
 ﻿#define NOMINMAX
 
 #include "fast/vr_openxr.h"
+#include "fast/vr_hud_settings.h"
+#include "vr_interface.h"
+
+bool g_vr_hud_layout_pass = false;
+bool g_vr_rect_world = false;
+float g_vr_rect_world_mtx[4][4] = {};
 
 #ifdef ENABLE_DX11
 
+#include <d3d11_1.h>
+#include <algorithm>
 #include <vector>
 #include <string>
 #include <cstring>
@@ -94,6 +102,14 @@ static void vr_apply_dimensions(uint32_t width, uint32_t height) {
 // eye size and a 2D target's size makes it tear down and reallocate eye-resolution textures
 // several times per game tick. Cheap invariant, expensive to get wrong.
 static void vr_restore_eye_dimensions();
+static bool vr_hud_wrist_layout();
+static int vr_hud_profile();
+static float vr_hud_panel_f(int child, int hand, const char* field, float def);
+// Wrist HUD canvas packing: native HUD px per layout unit (see the wrist layout section).
+static constexpr float kWristPack = 0.5f;
+static constexpr float kWristCanvasW = 160.0f; // native px per hand canvas
+static bool vr_wrist_panel_pose(int hand, XrPosef* pose, float* mpu, float* w_units, float* h_units);
+static void vr_hud_grab_update();
 
 // --------------------------------------------------------------------------
 // Internal state
@@ -203,6 +219,7 @@ static struct {
     bool plan_present_desktop;
     // Per-frame controller state (raw, in OpenXR local space)
     bool hand_active[2];
+    bool hand_tracked[2]; // position actually tracked this frame (not just valid: IMU-only drift is valid)
     XrPosef grip_pose[2];
     XrPosef grip_pose_raw[2]; // untouched by snap-turn; for compositor-space quads (hand HUD)
     XrPosef aim_pose[2];
@@ -225,6 +242,70 @@ static struct {
     void* hud_commands;
     bool rendering_hud;
 
+    // Text panel: the message system (dialogue, signs, item text, the ocarina staff) on its own
+    // quad that soft-follows in front of the player. Real metres in local_space, independent of
+    // world scale and Link's age. text_commands is non-NULL only while a text box is showing.
+    struct EyeSwapchain text_swapchain;
+    uint32_t text_image_index;
+    void* text_commands;
+    float text_crop[4];       // u0, v0, u1, v1 of the 320x240 frame: the region the panel shows
+    bool rendering_text;
+    bool text_has_image;      // rendered at least once since the text box opened
+    bool text_was_visible;    // last frame's submit decision: a hidden -> shown edge snaps the panel
+    glm::vec3 text_pos;       // panel centre, RAW local_space metres
+    glm::vec3 text_vel;       // critically damped follow velocity
+    glm::vec3 text_fwd;       // last valid level head-forward (fallback when looking straight up/down)
+    bool text_following;
+    // Wrist HUD layout. Per element (native 320x240 px): the extent it drew at on the TV layout this
+    // pass, its held extent (grows at once, shrinks only after a smaller one has held for a while,
+    // so a beating heart or a digit change never makes the layout twitch), its vanilla fade, and the
+    // offset that moves it into its slot on its hand's canvas (computed from the held extents at
+    // the end of each pass, applied on the next). Per hand: the laid-out block (the canvas region
+    // its quad shows, backing included) and the block's fade.
+    int hud_el;
+    float hud_meas[VR_HUD_EL_COUNT][4];
+    bool hud_meas_any[VR_HUD_EL_COUNT];
+    uint8_t hud_meas_alpha[VR_HUD_EL_COUNT];
+    float hud_rect[VR_HUD_EL_COUNT][4];
+    bool hud_rect_valid[VR_HUD_EL_COUNT];
+    int hud_shrink_passes[VR_HUD_EL_COUNT];
+    int hud_absent_passes[VR_HUD_EL_COUNT];
+    float hud_alpha[VR_HUD_EL_COUNT]; // 0..1, latched at the end of each HUD pass
+    float hud_slot[VR_HUD_EL_COUNT][3]; // slot top-left (native px) + draw scale
+    bool hud_placed[VR_HUD_EL_COUNT];
+    bool hud_child; // Link's age, pushed by the game: picks the Adult / Child settings profile
+    // In-headset HUD editing (gVrHud.GrabEdit): one hand grabs the OTHER wrist's panel (A/X +
+    // grip: the whole panel, rigidly) or one element on it (B/Y + grip: dragged across the
+    // panel's face). The edits are written live into the active profile's settings.
+    struct {
+        int grabber;       // hand holding something, -1 = none
+        int owner;         // the panel's hand
+        int element;       // VR_HUD_EL_* being dragged, -1 = the whole panel
+        glm::vec3 rel_pos; // panel pose in the grabber's grip frame (panel grab)
+        glm::quat rel_rot;
+        XrPosef frame;     // panel pose frozen at grab start (element drag)
+        float mpu;
+        glm::vec2 start_local;
+        float start_off[2];
+        int hover[2];      // per panel: 0 none, 1 a hand is in reach, 2 grabbed
+        bool swallow[2];   // hide this hand's buttons/grip/trigger from the game
+    } grab;
+    float hud_block[2][4]; // per hand canvas block, native px (x0, y0, x1, y1)
+    bool hud_block_valid[2];
+    float hud_block_alpha[2];
+    // World-anchored HUD (world-space pause): game-world centre/yaw/size, converted per frame.
+    bool hud_world;
+    glm::vec3 hud_world_center;
+    float hud_world_yaw;
+    float hud_world_size[2];
+    bool hud_world_pass; // this HUD pass draws for the world panel (no backings, no wrist latch)
+    ComPtr<ID3D11DeviceContext1> d3d_context1; // ClearView for the dark backings
+
+    // Centre-eye pose this frame, RAW tracking space (no artificial turn): what the head really did.
+    glm::vec3 head_pos_raw;
+    glm::quat head_rot_raw;
+    bool head_raw_valid;
+
     // Flat-screen mode: 2D contexts (file select, pause menu) render the whole frame onto a
     // world-locked floating panel instead of the stereo eyes. The last-rendered world frame keeps
     // being submitted behind it with its original pose, so it stays frozen-but-head-tracked.
@@ -244,6 +325,25 @@ static struct {
     ComPtr<ID3D11Texture2D> mirror_texture;
     ComPtr<ID3D11ShaderResourceView> mirror_srv;
 
+    // Desktop mirror of the headset's QUAD layers (HUD / wrist panels, text panel, flat-screen
+    // panel). They are composited by the runtime, so the eye mirror never contains them; the
+    // companion window redraws each one through the left eye instead (vr_get_mirror_quads).
+    // A swapchain image can't be read after release, so each 2D pass copies its image here while
+    // still acquired. [0] HUD, [1] text, [2] flat-screen panel.
+    struct LayerCopy {
+        ComPtr<ID3D11Texture2D> tex;
+        ComPtr<ID3D11ShaderResourceView> srv;
+        uint32_t w, h;
+    } layer_copy[3];
+    // The quads submitted this frame (pose in RAW local space, as the compositor got them).
+    struct MirrorQuad {
+        int src;
+        XrPosef pose;
+        XrExtent2Df size;
+        XrRect2Di rect;
+    } mirror_quads[8];
+    int mirror_quad_count;
+    DXGI_FORMAT view_format; // the swapchains' shader-view format (their images may be typeless)
     // D3D11 cached pointers
     ID3D11Device* d3d_device;
     ID3D11DeviceContext* d3d_context;
@@ -375,6 +475,104 @@ static void vr_reset_snap_turn(); // defined with the snap-turn state below
 // Per-hand thumbstick suppression for modal hand gestures (Alyx-style item selector) —
 // applied at the source in update_input, so every stick consumer inherits it.
 static bool g_stick_suppressed[2] = { false, false };
+// A game-side menu that owns the right stick while rendering in stereo (the world-space pause
+// menu: the stick is the C-stick there) turns artificial turning off without touching the stick.
+static bool g_turn_suppressed = false;
+
+// Physical climbing view lock (vr_set_climb_view_lock). The game moves Link's body opposite to the
+// gripping hand once per 20 Hz tick; interpolating the anchor between those ticks would leave the
+// view a tick behind the arm (the world "rubber-bands" behind every pull). While locked, the anchor
+// is the game's CURRENT one plus the hand's motion since the tick sampled it (ref), reversed and
+// restricted to the directions the game moves the body (in the wall plane; vertical only on a
+// ladder): the gripping hand stays exactly where it took hold and the view follows the arm at
+// headset rate. At the next tick the game's body move absorbs that motion and ref re-bases.
+static int g_climb_hand = -1;
+static glm::vec3 g_climb_ref(0.0f);
+static glm::vec3 g_climb_normal(0.0f);
+static bool g_climb_lateral = false;
+// Letting go: the locked view runs in real time, the interpolated anchor a 20 Hz tick behind, so
+// switching straight back would hop the view. Instead the view blends from where it was at the
+// release to the interpolated anchor over kClimbHandoffSec (smoothstep).
+static bool g_climb_handoff_active = false;
+static glm::vec3 g_climb_handoff_anchor(0.0f);
+static std::chrono::steady_clock::time_point g_climb_handoff_t0;
+static constexpr float kClimbHandoffSec = 0.12f;
+
+// Limits from the game (vr_set_climb_view_limits): how far the body can still go this tick along
+// the wall (t), up (y) and out from it (n) — the view never runs past what the next tick's
+// collision will allow (no overshoot-and-snap-back against the top, an edge, the floor, a ceiling
+// or the closest the view may come to the wall).
+static bool g_climb_lim_valid = false;
+static glm::vec3 g_climb_lim_out(0.0f); // n: horizontal, out of the wall
+static glm::vec3 g_climb_lim_lo(0.0f);  // allowed travel in -t, -y, -n (>= 0)
+static glm::vec3 g_climb_lim_hi(0.0f);  // allowed travel in +t, +y, +n (>= 0)
+// Tracking guards: the gripping hand losing positional tracking (IMU-only drift is still "valid"),
+// jumping (tracking reacquired, a glitch) or a system recenter must not move the view. The view then
+// holds its last offset until the game re-bases (it reads vr_consume_climb_discontinuity).
+static bool g_climb_frozen = false;
+static bool g_climb_discontinuity = false;
+static glm::vec3 g_climb_last_body(0.0f);
+static glm::vec3 g_climb_prev_live(0.0f);
+static bool g_climb_prev_valid = false;
+static constexpr float kClimbJumpMeters = 0.15f; // in one headset frame: never a real hand
+
+static glm::vec3 vr_climb_locked_anchor() {
+    const XrVector3f& p = xr.grip_pose[g_climb_hand].position;
+    const glm::vec3 live = glm::vec3(p.x, p.y, p.z) * xr.world_scale;
+    const bool tracked = xr.hand_tracked[g_climb_hand];
+    if (!tracked) {
+        g_climb_frozen = true;
+        g_climb_discontinuity = true;
+    } else if (g_climb_prev_valid) {
+        const glm::vec3 jump = live - g_climb_prev_live;
+        const float lim = kClimbJumpMeters * xr.world_scale;
+        if (glm::dot(jump, jump) > lim * lim) {
+            g_climb_frozen = true;
+            g_climb_discontinuity = true;
+        }
+    }
+    g_climb_prev_live = live;
+    g_climb_prev_valid = tracked;
+    if (g_climb_frozen) {
+        return xr.anchor + g_climb_last_body;
+    }
+
+    glm::vec3 d = live - g_climb_ref;
+    d -= g_climb_normal * glm::dot(d, g_climb_normal);
+    if (!g_climb_lateral) {
+        d.x = d.z = 0.0f;
+    }
+    glm::vec3 body = -d;
+    if (g_climb_lim_valid) {
+        const glm::vec3 n = g_climb_lim_out;
+        const glm::vec3 t(-n.z, 0.0f, n.x);
+        const float bt = glm::clamp(glm::dot(body, t), -g_climb_lim_lo.x, g_climb_lim_hi.x);
+        const float by = glm::clamp(body.y, -g_climb_lim_lo.y, g_climb_lim_hi.y);
+        const float bn = glm::clamp(glm::dot(body, n), -g_climb_lim_lo.z, g_climb_lim_hi.z);
+        body = t * bt + glm::vec3(0.0f, by, 0.0f) + n * bn;
+    }
+    g_climb_last_body = body;
+    return xr.anchor + body;
+}
+
+// The anchor every game-facing composition uses this render pass (camera, hands, quads, sim).
+static glm::vec3 vr_anchor_now() {
+    if (g_climb_hand >= 0 && xr.first_person && xr.hand_active[g_climb_hand]) {
+        return vr_climb_locked_anchor();
+    }
+    const glm::vec3 base = glm::mix(xr.anchor_prev, xr.anchor, xr.interp_alpha);
+    if (g_climb_handoff_active) {
+        const float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - g_climb_handoff_t0).count();
+        const glm::vec3 gap = base - g_climb_handoff_anchor;
+        if (t >= kClimbHandoffSec || !xr.first_person || glm::dot(gap, gap) > 200.0f * 200.0f) {
+            g_climb_handoff_active = false;
+        } else {
+            const float k = t / kClimbHandoffSec;
+            return glm::mix(g_climb_handoff_anchor, base, k * k * (3.0f - 2.0f * k));
+        }
+    }
+    return base;
+}
 
 static void poll_events() {
     XrEventDataBuffer event = { XR_TYPE_EVENT_DATA_BUFFER };
@@ -400,6 +598,10 @@ static void poll_events() {
                 spdlog::info("[VR] System recenter — realigning playspace");
                 vr_reset_snap_turn();                    // accumulated turn was in old-space coords
                 vr_reset_roomscale();                    // old-space origin would read as a huge lean
+                if (g_climb_hand >= 0) {                 // a climbing hand's ref is in the old space
+                    g_climb_frozen = true;
+                    g_climb_discontinuity = true;
+                }
                 xr.scale_recalibrate_requested = true;   // player is standing normally right now
                 xr.flat_screen_prev = false;             // re-place the menu panel in the new space
             }
@@ -570,6 +772,7 @@ static void update_input() {
         const bool valid = (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
                            (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT);
         xr.hand_active[h] = valid;
+        xr.hand_tracked[h] = valid && (loc.locationFlags & XR_SPACE_LOCATION_POSITION_TRACKED_BIT);
         if (valid) {
             xr.grip_pose[h] = loc.pose;
         }
@@ -712,6 +915,39 @@ static float vr_wrap180(float deg) {
     return deg - 180.0f;
 }
 
+// One-shot "face this way" (vr_request_face_yaw): an instant artificial turn, consumed by the next
+// frame's turn block, that leaves the player's heading on the requested game yaw.
+static bool g_face_yaw_pending = false;
+static int16_t g_face_yaw = 0;
+
+void vr_set_climb_view_limits(const float wall_out[3], const float lo[3], const float hi[3]) {
+    if (wall_out == nullptr || lo == nullptr || hi == nullptr) {
+        g_climb_lim_valid = false;
+        return;
+    }
+    glm::vec3 n(wall_out[0], 0.0f, wall_out[2]);
+    const float len = glm::length(n);
+    if (len < 1e-4f) {
+        g_climb_lim_valid = false;
+        return;
+    }
+    g_climb_lim_out = n / len;
+    g_climb_lim_lo = glm::max(glm::vec3(lo[0], lo[1], lo[2]), glm::vec3(0.0f));
+    g_climb_lim_hi = glm::max(glm::vec3(hi[0], hi[1], hi[2]), glm::vec3(0.0f));
+    g_climb_lim_valid = true;
+}
+
+bool vr_consume_climb_discontinuity() {
+    const bool d = g_climb_discontinuity;
+    g_climb_discontinuity = false;
+    return d;
+}
+
+void vr_request_face_yaw(int16_t yaw_binang) {
+    g_face_yaw = yaw_binang;
+    g_face_yaw_pending = true;
+}
+
 void vr_set_lockon_yaw(int16_t yaw_binang, bool active) {
     g_lockon_yaw = yaw_binang;
     g_lockon_ttl = active ? kLockOnTtlSeconds : 0.0f;
@@ -746,6 +982,11 @@ bool vr_init() {
     // Get D3D11 device
     xr.d3d_device = static_cast<ID3D11Device*>(gfx_d3d11_get_device());
     xr.d3d_context = static_cast<ID3D11DeviceContext*>(gfx_d3d11_get_context());
+    xr.d3d_context1.Reset();
+    if (xr.d3d_context) {
+        xr.d3d_context->QueryInterface(__uuidof(ID3D11DeviceContext1),
+                                       reinterpret_cast<void**>(xr.d3d_context1.GetAddressOf()));
+    }
     if (!xr.d3d_device || !xr.d3d_context) {
         spdlog::error("[VR] D3D11 device not available");
         return false;
@@ -945,6 +1186,7 @@ bool vr_init() {
     DXGI_FORMAT view_format = (chosen_format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
                                   ? DXGI_FORMAT_R8G8B8A8_UNORM
                                   : static_cast<DXGI_FORMAT>(chosen_format);
+    xr.view_format = view_format;
     spdlog::info("[VR] Swapchain format: {} (UNORM={}, SRGB={}), view format: {}",
                  chosen_format, (int)DXGI_FORMAT_R8G8B8A8_UNORM, (int)DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
                  (int)view_format);
@@ -1087,11 +1329,13 @@ bool vr_init() {
         return false;
     }
 
-    // --- Create HUD swapchain (1024x768, 4:3) ---
+    // --- Create HUD swapchain (2048x1536, 4:3) ---
+    // Twice the old 1024x768: the wrist layout packs each hand's canvas at half scale (twice the
+    // room for moved / enlarged elements), and this keeps those elements as sharp as before.
     {
         auto& sc = xr.hud_swapchain;
-        sc.width = 1024;
-        sc.height = 768;
+        sc.width = 2048;
+        sc.height = 1536;
         sc.format = chosen_format;
 
         XrSwapchainCreateInfo swapchain_ci = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
@@ -1201,10 +1445,70 @@ bool vr_init() {
         spdlog::info("[VR] Screen swapchain: {}x{}, {} images", sc.width, sc.height, image_count);
     }
 
+    // --- Create text-panel swapchain. 4:3 like the HUD, so the interpreter's 2D aspect handling is
+    // the identity and every texrect lands exactly where vanilla put it; the layer then crops its
+    // imageRect to the text box. Higher resolution than the HUD: this one is read word by word.
+    {
+        auto& sc = xr.text_swapchain;
+        sc.width = 1280;
+        sc.height = 960;
+        sc.format = chosen_format;
+
+        XrSwapchainCreateInfo swapchain_ci = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
+        swapchain_ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+        swapchain_ci.format = chosen_format;
+        swapchain_ci.sampleCount = 1;
+        swapchain_ci.width = sc.width;
+        swapchain_ci.height = sc.height;
+        swapchain_ci.faceCount = 1;
+        swapchain_ci.arraySize = 1;
+        swapchain_ci.mipCount = 1;
+
+        if (!xr_check(xrCreateSwapchain(xr.session, &swapchain_ci, &sc.handle), "xrCreateSwapchain (text)")) {
+            vr_shutdown();
+            return false;
+        }
+
+        uint32_t image_count = 0;
+        xrEnumerateSwapchainImages(sc.handle, 0, &image_count, nullptr);
+        sc.images.resize(image_count, { XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR });
+        xrEnumerateSwapchainImages(sc.handle, image_count, &image_count,
+                                   reinterpret_cast<XrSwapchainImageBaseHeader*>(sc.images.data()));
+
+        sc.rtvs.resize(image_count);
+        sc.dsvs.resize(image_count);
+        sc.depth_textures.resize(image_count);
+
+        for (uint32_t i = 0; i < image_count; i++) {
+            D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+            rtv_desc.Format = view_format;
+            rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+            xr.d3d_device->CreateRenderTargetView(sc.images[i].texture, &rtv_desc, sc.rtvs[i].GetAddressOf());
+
+            D3D11_TEXTURE2D_DESC depth_desc = {};
+            depth_desc.Width = sc.width;
+            depth_desc.Height = sc.height;
+            depth_desc.MipLevels = 1;
+            depth_desc.ArraySize = 1;
+            depth_desc.Format = DXGI_FORMAT_D32_FLOAT;
+            depth_desc.SampleDesc.Count = 1;
+            depth_desc.Usage = D3D11_USAGE_DEFAULT;
+            depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+            xr.d3d_device->CreateTexture2D(&depth_desc, nullptr, sc.depth_textures[i].GetAddressOf());
+
+            D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc = {};
+            dsv_desc.Format = DXGI_FORMAT_D32_FLOAT;
+            dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+            xr.d3d_device->CreateDepthStencilView(sc.depth_textures[i].Get(), &dsv_desc, sc.dsvs[i].GetAddressOf());
+        }
+        spdlog::info("[VR] Text swapchain: {}x{}, {} images", sc.width, sc.height, image_count);
+    }
+
     // Initialize views
     xr.views[0] = { XR_TYPE_VIEW };
     xr.views[1] = { XR_TYPE_VIEW };
 
+    xr.grab.grabber = -1;
     xr.initialized = true;
     xr.enabled = true;
     spdlog::info("[VR] OpenXR initialized successfully");
@@ -1239,12 +1543,28 @@ void vr_shutdown() {
         sc.rtvs.clear(); sc.dsvs.clear(); sc.depth_textures.clear(); sc.images.clear();
         if (sc.handle != XR_NULL_HANDLE) { xrDestroySwapchain(sc.handle); sc.handle = XR_NULL_HANDLE; }
     }
+
+    {
+        auto& sc = xr.text_swapchain;
+        sc.rtvs.clear(); sc.dsvs.clear(); sc.depth_textures.clear(); sc.images.clear();
+        if (sc.handle != XR_NULL_HANDLE) { xrDestroySwapchain(sc.handle); sc.handle = XR_NULL_HANDLE; }
+    }
+    xr.text_commands = nullptr;
+    xr.text_has_image = false;
+    xr.text_was_visible = false;
+    xr.head_raw_valid = false;
     xr.eyes_ever_rendered = false;
     xr.flat_screen = false;
     xr.flat_screen_prev = false;
 
     xr.mirror_srv.Reset();
     xr.mirror_texture.Reset();
+    for (auto& c : xr.layer_copy) {
+        c.srv.Reset();
+        c.tex.Reset();
+        c.w = c.h = 0;
+    }
+    xr.mirror_quad_count = 0;
     if (xr.view_space != XR_NULL_HANDLE) {
         xrDestroySpace(xr.view_space);
         xr.view_space = XR_NULL_HANDLE;
@@ -1479,7 +1799,8 @@ bool vr_begin_frame() {
     // the same head-pivot turn accumulation, so the physics sim and every game-facing pose
     // compose identically. Suspended in flat-screen mode (right stick navigates menus) and in
     // third person (the stock game owns the camera and the right stick is pure C-buttons).
-    if (xr.input_initialized && !xr.flat_screen && xr.first_person && CVarGetInteger("gVrSnapTurnOn", 1)) {
+    if (xr.input_initialized && !xr.flat_screen && xr.first_person && !g_turn_suppressed &&
+        CVarGetInteger("gVrSnapTurnOn", 1)) {
         static int snap_latch = 0;
         const float sx = xr.thumbstick_x[1];
         if (CVarGetInteger("gVrTurnStyle", 0) == 1) {
@@ -1572,6 +1893,17 @@ bool vr_begin_frame() {
         }
     }
 
+    // A one-shot "face this way" from the game (getting onto a ladder from above: turn to face it).
+    // Same head-pivot rotation and the same sign convention as the lock-on correction above.
+    if (g_face_yaw_pending) {
+        g_face_yaw_pending = false;
+        int16_t heading = 0;
+        if (xr.input_initialized && !xr.flat_screen && xr.first_person && vr_pending_heading_yaw(&heading)) {
+            const float err_deg = (float)(int16_t)(g_face_yaw - heading) * (180.0f / 32768.0f);
+            vr_apply_snap_turn(-err_deg);
+        }
+    }
+
     // Apply the accumulated snap-turn to every game-facing pose, preserving the raw view poses for
     // layer submission in vr_end_frame. Hand poses are only adjusted when freshly located this frame
     // (a stale pose already carries the previous turn and would be double-rotated). The submit
@@ -1580,6 +1912,22 @@ bool vr_begin_frame() {
     // last world frame described by the frustum it was rendered from, so the compositor reprojects
     // it correctly instead of stretching it onto a pose it never matched.
     const bool refresh_submit = !xr.flat_screen && xr.plan_render_eyes;
+    // Centre eye in RAW tracking space, every frame (submit_pose only refreshes on redraw frames):
+    // the soft-follow text panel is placed from where the head physically is.
+    if ((view_state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) &&
+        (view_state.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT)) {
+        const XrPosef& p0 = xr.views[0].pose;
+        const XrPosef& p1 = xr.views[1].pose;
+        glm::quat q0(p0.orientation.w, p0.orientation.x, p0.orientation.y, p0.orientation.z);
+        glm::quat q1(p1.orientation.w, p1.orientation.x, p1.orientation.y, p1.orientation.z);
+        if (glm::dot(q0, q1) < 0.0f) {
+            q1 = -q1;
+        }
+        xr.head_rot_raw = glm::normalize(q0 + q1);
+        xr.head_pos_raw = 0.5f * glm::vec3(p0.position.x + p1.position.x, p0.position.y + p1.position.y,
+                                           p0.position.z + p1.position.z);
+        xr.head_raw_valid = true;
+    }
     for (int eye = 0; eye < 2; eye++) {
         if (refresh_submit || !xr.eyes_ever_rendered) {
             xr.submit_pose[eye] = xr.views[eye].pose;
@@ -1594,6 +1942,21 @@ bool vr_begin_frame() {
             xr.grip_pose_raw[h] = xr.grip_pose[h];
             xr.grip_pose[h] = apply_turn(xr.grip_pose[h]);
             xr.aim_pose[h] = apply_turn(xr.aim_pose[h]);
+        }
+    }
+
+    // In-headset HUD editing (grab a wrist panel / element with the other hand). What it uses is
+    // hidden from the game, which reads these values on its next tick.
+    vr_hud_grab_update();
+    for (int h = 0; h < 2; h++) {
+        if (xr.grab.swallow[h]) {
+            if (xr.grab.grabber == h) {
+                xr.buttons[h] = 0;
+                xr.squeeze_value[h] = 0.0f;
+                xr.trigger_value[h] = 0.0f;
+            } else {
+                xr.buttons[h] &= ~((1 << 2) | (1 << 3)); // A/B or X/Y
+            }
         }
     }
 
@@ -1620,7 +1983,7 @@ bool vr_begin_frame() {
         const float turn_quat[4] = { g_turn_rot.x, g_turn_rot.y, g_turn_rot.z, g_turn_rot.w };
         const float turn_off[3] = { g_turn_off.x, g_turn_off.y, g_turn_off.z };
         const glm::vec3 anchor = (xr.first_person && xr.anchor_initialized)
-                                     ? glm::mix(xr.anchor_prev, xr.anchor, xr.interp_alpha)
+                                     ? vr_anchor_now()
                                      : glm::vec3(0.0f);
         const float anchor_units[3] = { anchor.x, anchor.y, anchor.z };
         vrphys_step(dt, turn_quat, turn_off, anchor_units, xr.world_scale, xr.first_person);
@@ -1640,6 +2003,319 @@ bool vr_begin_frame() {
     }
 
     return true;
+}
+
+// Soft-follow placement of the text panel, in RAW local_space metres (a compositor quad must not
+// carry the artificial turn, and real metres keep it the same size whatever the world scale or
+// Link's age). The panel sits level at gVrTextDistance along the head's LEVEL forward,
+// gVrTextHeight below/above the eyes, always facing the head about the vertical axis only — no
+// pitch, no roll. It snaps into place when a text box opens; after that it stays put while the head
+// looks around inside a deadzone, and once the player turns (or walks, or stands up) past it, it
+// glides to the new front with a critically damped follow and stops dead when it arrives — no
+// overshoot, and no perpetual drift from tracking noise.
+static XrPosef text_panel_place(bool snap, float dt) {
+    const glm::quat& hq = xr.head_rot_raw;
+    const glm::vec3 head = xr.head_pos_raw;
+
+    // Level forward that stays defined looking straight up or down: blend the forward vector's
+    // horizontal part with the up vector's (which tips toward/away from the view direction as
+    // the head pitches). Exact for pure pitch; roll only nudges it.
+    const glm::vec3 f = hq * glm::vec3(0.0f, 0.0f, -1.0f);
+    const glm::vec3 u = hq * glm::vec3(0.0f, 1.0f, 0.0f);
+    glm::vec3 fh = glm::vec3(f.x, 0.0f, f.z) * u.y - glm::vec3(u.x, 0.0f, u.z) * f.y;
+    if (glm::length(fh) > 1e-4f) {
+        xr.text_fwd = glm::normalize(fh);
+    } else if (glm::length(xr.text_fwd) < 0.5f) {
+        xr.text_fwd = glm::vec3(0.0f, 0.0f, -1.0f);
+    }
+
+    const float dist = std::clamp(CVarGetFloat("gVrTextDistance", 1.4f), 0.4f, 4.0f);
+    const glm::vec3 target = head + xr.text_fwd * dist + glm::vec3(0.0f, CVarGetFloat("gVrTextHeight", -0.15f), 0.0f);
+
+    if (snap) {
+        xr.text_pos = target;
+        xr.text_vel = glm::vec3(0.0f);
+        xr.text_following = false;
+    } else {
+        const glm::vec3 to = xr.text_pos - head;
+        const glm::vec3 to_h(to.x, 0.0f, to.z);
+        const float to_h_len = glm::length(to_h);
+        const float cos_err = to_h_len > 1e-4f ? glm::dot(to_h / to_h_len, xr.text_fwd) : -1.0f;
+        const float err_deg = acosf(std::clamp(cos_err, -1.0f, 1.0f)) * (180.0f / 3.14159265358979323846f);
+        const float gap = glm::length(target - xr.text_pos);
+
+        if (err_deg > 100.0f || gap > 2.0f) {
+            // Recentre, a teleport in tracking space, or a full turn-around: gliding a panel through
+            // or around the player's head reads worse than simply re-placing it.
+            xr.text_pos = target;
+            xr.text_vel = glm::vec3(0.0f);
+            xr.text_following = false;
+        } else {
+            if (!xr.text_following &&
+                (err_deg > CVarGetFloat("gVrTextFollowDeg", 20.0f) || fabsf(xr.text_pos.y - target.y) > 0.15f ||
+                 fabsf(to_h_len - dist) > 0.35f)) {
+                xr.text_following = true;
+            }
+            if (xr.text_following) {
+                // Critically damped spring toward the (moving) target: smooth start, no overshoot.
+                const float tau = std::max(CVarGetFloat("gVrTextFollowSpeed", 0.25f), 0.02f);
+                const float omega = 2.0f / tau;
+                const float x = omega * dt;
+                const float decay = 1.0f / (1.0f + x + 0.48f * x * x + 0.235f * x * x * x);
+                const glm::vec3 change = xr.text_pos - target;
+                const glm::vec3 temp = (xr.text_vel + omega * change) * dt;
+                xr.text_vel = (xr.text_vel - omega * temp) * decay;
+                xr.text_pos = target + (change + temp) * decay;
+                // Arrived (2 cm is under a degree at reading distance): stop dead, so the panel is
+                // perfectly still while reading instead of chasing head-tracking noise.
+                if (glm::length(target - xr.text_pos) < 0.02f) {
+                    xr.text_vel = glm::vec3(0.0f);
+                    xr.text_following = false;
+                }
+            }
+        }
+    }
+
+    // Face the head about the vertical axis only (level panel, level text). A quad's visible face
+    // is its +Z; rotating +Z by yaw about Y gives (sin yaw, 0, cos yaw).
+    const glm::vec3 back = head - xr.text_pos;
+    const float yaw = atan2f(back.x, back.z);
+    const glm::quat q = glm::angleAxis(yaw, glm::vec3(0.0f, 1.0f, 0.0f));
+
+    XrPosef pose;
+    pose.position = { xr.text_pos.x, xr.text_pos.y, xr.text_pos.z };
+    pose.orientation = { q.x, q.y, q.z, q.w };
+    return pose;
+}
+
+// A wrist panel's quad: pose in RAW local space (grip anchor + the profile's offset/rotation),
+// metres per layout unit, and card size in layout units. false if the panel isn't shown.
+static bool vr_wrist_panel_pose(int hand, XrPosef* pose, float* mpu, float* w_units, float* h_units) {
+    if (!xr.hand_active[hand] || !xr.hud_block_valid[hand] || xr.hud_block_alpha[hand] <= 0.0f) {
+        return false;
+    }
+    const float kDeg = 3.14159265358979323846f / 180.0f;
+    const int child = vr_hud_profile();
+    const VrHudPanelDefaults& pd = kVrHudPanelDefaults[child][hand];
+    const float* b = xr.hud_block[hand];
+
+    // Panel pose in the grip frame (cm, degrees): yaw about the grip's up, then pitch, then roll
+    // about the panel's own normal.
+    const XrPosef& gp = xr.grip_pose_raw[hand];
+    const glm::quat gq(gp.orientation.w, gp.orientation.x, gp.orientation.y, gp.orientation.z);
+    const glm::vec3 off(vr_hud_panel_f(child, hand, "X", pd.x), vr_hud_panel_f(child, hand, "Y", pd.y),
+                        vr_hud_panel_f(child, hand, "Z", pd.z));
+    const glm::vec3 c = glm::vec3(gp.position.x, gp.position.y, gp.position.z) + gq * (off * 0.01f);
+    const glm::quat q =
+        gq * glm::angleAxis(vr_hud_panel_f(child, hand, "Yaw", pd.yaw) * kDeg, glm::vec3(0.0f, 1.0f, 0.0f)) *
+        glm::angleAxis(vr_hud_panel_f(child, hand, "Pitch", pd.pitch) * kDeg, glm::vec3(1.0f, 0.0f, 0.0f)) *
+        glm::angleAxis(vr_hud_panel_f(child, hand, "Roll", pd.roll) * kDeg, glm::vec3(0.0f, 0.0f, 1.0f));
+    pose->position = { c.x, c.y, c.z };
+    pose->orientation = { q.x, q.y, q.z, q.w };
+    // 0.8 mm per layout unit at 100%; the block is in native px, kWristPack px per unit.
+    *mpu = 0.0008f * std::clamp(vr_hud_panel_f(child, hand, "Scale", pd.scale), 10.0f, 1000.0f) / 100.0f;
+    *w_units = (b[2] - b[0]) / kWristPack;
+    *h_units = (b[3] - b[1]) / kWristPack;
+    return true;
+}
+
+static void vr_hud_set_f(const char* name, float v) {
+    CVarSetFloat(name, v);
+}
+
+// A point in a panel's plane coordinates (metres from its centre, +x right, +y up).
+static glm::vec2 vr_panel_local(const XrPosef& pose, const glm::vec3& w) {
+    const glm::quat q(pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z);
+    const glm::vec3 l = glm::inverse(q) * (w - glm::vec3(pose.position.x, pose.position.y, pose.position.z));
+    return glm::vec2(l.x, l.y);
+}
+
+// Distance from a point to a panel quad (0 when right on its face).
+static float vr_panel_distance(const XrPosef& pose, float w, float h, const glm::vec3& p) {
+    const glm::quat q(pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z);
+    const glm::vec3 l = glm::inverse(q) * (p - glm::vec3(pose.position.x, pose.position.y, pose.position.z));
+    const float dx = std::max(fabsf(l.x) - w * 0.5f, 0.0f);
+    const float dy = std::max(fabsf(l.y) - h * 0.5f, 0.0f);
+    return sqrtf(dx * dx + dy * dy + l.z * l.z);
+}
+
+// In-headset HUD editing. Runs every XR frame after input is read and the raw grips are known,
+// before the game reads input for its next tick, so what it swallows never reaches gameplay:
+//   A / X + grip near the OTHER wrist's panel: grab the panel. It follows the grabbing hand
+//     rigidly; its pose relative to its own wrist is written to the profile every frame.
+//   B / Y + grip: grab the element nearest the hand on that panel and drag it across the face.
+// While a hand is in reach of a panel its A/B/X/Y are swallowed; while it holds something all of
+// its buttons, grip and trigger are. Release grip to drop (settings saved).
+static void vr_hud_grab_update() {
+    auto& g = xr.grab;
+    g.hover[0] = g.hover[1] = 0;
+    g.swallow[0] = g.swallow[1] = false;
+    const bool enabled = CVarGetInteger("gVrHud.GrabEdit", 1) != 0 && vr_hud_wrist_layout() && !xr.hud_world &&
+                         !xr.flat_screen && xr.hud_ever_rendered && xr.hud_commands != nullptr;
+    if (!enabled) {
+        g.grabber = -1;
+        return;
+    }
+    const int child = vr_hud_profile();
+    const float kRadToDeg = 180.0f / 3.14159265358979323846f;
+    char name[96];
+
+    // Holding: update, or drop on grip release.
+    if (g.grabber >= 0) {
+        const int h = g.grabber;
+        const int o = g.owner;
+        if (!xr.hand_active[h] || !xr.hand_active[o] || xr.squeeze_value[h] < 0.35f) {
+            vr_trigger_haptic(h, 0.3f, 0.0f, 25.0f);
+            g.grabber = -1;
+            CVarSave();
+            return;
+        }
+        g.swallow[h] = true;
+        g.hover[o] = 2;
+        const XrPosef& gp = xr.grip_pose_raw[h];
+        const glm::quat gq(gp.orientation.w, gp.orientation.x, gp.orientation.y, gp.orientation.z);
+        const glm::vec3 gpos(gp.position.x, gp.position.y, gp.position.z);
+        if (g.element < 0) {
+            // Panel: new world pose = grabber * rel, written back relative to the owner's grip.
+            const glm::vec3 wp = gpos + gq * g.rel_pos;
+            const glm::quat wq = glm::normalize(gq * g.rel_rot);
+            const XrPosef& op = xr.grip_pose_raw[o];
+            const glm::quat oq(op.orientation.w, op.orientation.x, op.orientation.y, op.orientation.z);
+            const glm::quat oinv = glm::inverse(oq);
+            const glm::vec3 off = oinv * (wp - glm::vec3(op.position.x, op.position.y, op.position.z)) * 100.0f;
+            // local = RotY(yaw) RotX(pitch) RotZ(roll); R[r][c] = m[c][r].
+            const glm::mat3 m = glm::mat3_cast(glm::normalize(oinv * wq));
+            const float pitch = asinf(std::clamp(-m[2][1], -1.0f, 1.0f));
+            const float roll = atan2f(m[0][1], m[1][1]);
+            const float yaw = atan2f(m[2][0], m[2][2]);
+            const char* fields[6] = { "X", "Y", "Z", "Yaw", "Pitch", "Roll" };
+            const float vals[6] = { off.x, off.y, off.z, yaw * kRadToDeg, pitch * kRadToDeg, roll * kRadToDeg };
+            for (int i = 0; i < 6; i++) {
+                VrHudPanelCVar(name, sizeof(name), child, o, fields[i]);
+                vr_hud_set_f(name, vals[i]);
+            }
+        } else {
+            // Element: drag in the panel plane frozen at grab start, in layout units (y down).
+            const glm::vec2 l = vr_panel_local(g.frame, gpos);
+            const VrHudElementDesc* d = VrHudElementById(g.element);
+            if (d != nullptr && g.mpu > 0.0f) {
+                VrHudElementCVar(name, sizeof(name), child, d->key, "X");
+                vr_hud_set_f(name, g.start_off[0] + (l.x - g.start_local.x) / g.mpu);
+                VrHudElementCVar(name, sizeof(name), child, d->key, "Y");
+                vr_hud_set_f(name, g.start_off[1] - (l.y - g.start_local.y) / g.mpu);
+            }
+        }
+        return;
+    }
+
+    // Not holding: hover / grab start. A hand only reaches for the OTHER wrist's panel.
+    static bool s_grip_was[2] = { false, false };
+    for (int h = 0; h < 2; h++) {
+        const int o = 1 - h;
+        const bool grip = xr.squeeze_value[h] > 0.7f;
+        const bool grip_edge = grip && !s_grip_was[h];
+        s_grip_was[h] = grip;
+        if (!xr.hand_active[h]) {
+            continue;
+        }
+        XrPosef pose;
+        float mpu, wu, hu;
+        if (!vr_wrist_panel_pose(o, &pose, &mpu, &wu, &hu)) {
+            continue;
+        }
+        const XrPosef& gp = xr.grip_pose_raw[h];
+        const glm::vec3 gpos(gp.position.x, gp.position.y, gp.position.z);
+        if (vr_panel_distance(pose, wu * mpu, hu * mpu, gpos) > 0.12f) {
+            continue;
+        }
+        g.hover[o] = std::max(g.hover[o], 1);
+        const bool mod_panel = (xr.buttons[h] & (1 << 2)) != 0;   // A (right) / X (left)
+        const bool mod_element = (xr.buttons[h] & (1 << 3)) != 0; // B (right) / Y (left)
+        if (mod_panel || mod_element) {
+            g.swallow[h] = true;
+        }
+        if (!grip_edge || !(mod_panel || mod_element)) {
+            continue;
+        }
+
+        const glm::quat gq(gp.orientation.w, gp.orientation.x, gp.orientation.y, gp.orientation.z);
+        g.owner = o;
+        g.element = -1;
+        if (mod_panel) {
+            const glm::quat pq(pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z);
+            const glm::vec3 pp(pose.position.x, pose.position.y, pose.position.z);
+            g.rel_pos = glm::inverse(gq) * (pp - gpos);
+            g.rel_rot = glm::normalize(glm::inverse(gq) * pq);
+        } else {
+            // The element under (or nearest) the hand, in card units (origin top-left, y down).
+            const glm::vec2 l = vr_panel_local(pose, gpos);
+            const float ux = l.x / mpu + wu * 0.5f;
+            const float uy = hu * 0.5f - l.y / mpu;
+            float best = 30.0f; // units
+            for (int el = 0; el < VR_HUD_EL_COUNT; el++) {
+                const VrHudElementDesc* d = VrHudElementById(el);
+                if (d == nullptr || d->hand != o || !xr.hud_placed[el] || !xr.hud_rect_valid[el]) {
+                    continue;
+                }
+                const float x0 = (xr.hud_slot[el][0] - o * kWristCanvasW) / kWristPack;
+                const float y0 = xr.hud_slot[el][1] / kWristPack;
+                const float s = xr.hud_slot[el][2] / kWristPack;
+                const float x1 = x0 + (xr.hud_rect[el][2] - xr.hud_rect[el][0]) * s;
+                const float y1 = y0 + (xr.hud_rect[el][3] - xr.hud_rect[el][1]) * s;
+                const float dx = std::max(std::max(x0 - ux, ux - x1), 0.0f);
+                const float dy = std::max(std::max(y0 - uy, uy - y1), 0.0f);
+                const float dist = sqrtf(dx * dx + dy * dy);
+                if (dist < best) {
+                    best = dist;
+                    g.element = el;
+                }
+            }
+            if (g.element < 0) {
+                continue;
+            }
+            const VrHudElementDesc* d = VrHudElementById(g.element);
+            g.frame = pose;
+            g.mpu = mpu;
+            g.start_local = l;
+            VrHudElementCVar(name, sizeof(name), child, d->key, "X");
+            g.start_off[0] = CVarGetFloat(name, d->x[child]);
+            VrHudElementCVar(name, sizeof(name), child, d->key, "Y");
+            g.start_off[1] = CVarGetFloat(name, d->y[child]);
+        }
+        g.grabber = h;
+        g.swallow[h] = true;
+        g.hover[o] = 2;
+        vr_trigger_haptic(h, 0.6f, 0.0f, 40.0f);
+        return;
+    }
+}
+
+// A game-world pose (position in game units, facing = RotateY(yaw)) as a RAW tracking-space pose
+// for a compositor quad: the exact inverse of vr_get_head_matrix's composition
+// (world = anchor + unyaw(gamma) * turned * world_scale, turned = turn * raw), with the same
+// interpolated anchor and gamma this frame renders with, so the quad sits on the world geometry.
+static XrPosef game_world_to_raw(const glm::vec3& p, float yaw) {
+    glm::vec3 anchor(0.0f);
+    float g = 0.0f;
+    if (xr.anchor_initialized) {
+        anchor = vr_anchor_now();
+        g = xr.anchor_gamma_prev + (xr.anchor_gamma - xr.anchor_gamma_prev) * xr.interp_alpha;
+    }
+    const float cg = cosf(g), sg = sinf(g);
+    const glm::mat3 unyaw(glm::vec3(cg, 0.0f, sg), glm::vec3(0.0f, 1.0f, 0.0f), glm::vec3(-sg, 0.0f, cg));
+    const glm::mat3 reyaw = glm::transpose(unyaw);
+    const float ws = xr.world_scale > 0.0f ? xr.world_scale : 1.0f;
+    const glm::quat turn_inv = glm::inverse(g_turn_rot);
+
+    const glm::vec3 turned = reyaw * (p - anchor) / ws;
+    const glm::vec3 raw = turn_inv * (turned - g_turn_off);
+    const glm::quat q_world = glm::angleAxis(yaw, glm::vec3(0.0f, 1.0f, 0.0f));
+    const glm::quat q_raw = glm::normalize(turn_inv * glm::quat_cast(reyaw) * q_world);
+
+    XrPosef pose;
+    pose.position = { raw.x, raw.y, raw.z };
+    pose.orientation = { q_raw.x, q_raw.y, q_raw.z, q_raw.w };
+    return pose;
 }
 
 void vr_end_frame() {
@@ -1737,6 +2413,63 @@ void vr_end_frame() {
     }
     hud_layer.size = { hud_width, hud_width * 0.75f }; // 4:3, matching the HUD swapchain
 
+    // Wrist layout: crops of the same HUD image, one stack per controller — vitals on the LEFT,
+    // buttons over the minimap on the RIGHT (physical hands by design, not handedness). Each crop
+    // is sized at a fixed metres-per-native-pixel, so every element keeps the same real size
+    // whatever the crop; the stack is centred on the same grip anchor/tilt as the classic hand HUD
+    // (gVrHudHandOff*, gVrHudHandPitch, X mirrored on the right). A hand that isn't tracked shows
+    // nothing (no head-locked fallback), a group that's faded out or not drawn drops out of its stack.
+    // World-space pause: the whole HUD image on one world-anchored quad framing the front page
+    // (VR_SetHudWorldPanel); replaces both the wrist stacks and the classic quad meanwhile.
+    XrCompositionLayerQuad hud_world_layer = { XR_TYPE_COMPOSITION_LAYER_QUAD };
+    const bool hud_world = xr.hud_world && xr.hud_ever_rendered && xr.hud_commands != nullptr;
+    if (hud_world) {
+        const float ws = xr.world_scale > 0.0f ? xr.world_scale : 1.0f;
+        hud_world_layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+        hud_world_layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+        hud_world_layer.space = xr.local_space;
+        hud_world_layer.subImage.swapchain = xr.hud_swapchain.handle;
+        hud_world_layer.subImage.imageRect.offset = { 0, 0 };
+        hud_world_layer.subImage.imageRect.extent = { (int32_t)xr.hud_swapchain.width,
+                                                      (int32_t)xr.hud_swapchain.height };
+        hud_world_layer.subImage.imageArrayIndex = 0;
+        hud_world_layer.pose = game_world_to_raw(xr.hud_world_center, xr.hud_world_yaw);
+        hud_world_layer.size = { std::max(xr.hud_world_size[0] / ws, 0.01f),
+                                 std::max(xr.hud_world_size[1] / ws, 0.01f) };
+    }
+
+    XrCompositionLayerQuad wrist_layers[2];
+    uint32_t wrist_count = 0;
+    const bool wrist_layout = vr_hud_wrist_layout();
+    if (wrist_layout && !xr.hud_world && xr.hud_ever_rendered && xr.hud_commands != nullptr) {
+        const auto& sc = xr.hud_swapchain;
+        const float sx = sc.width / 320.0f, sy = sc.height / 240.0f;
+        for (int hand = 0; hand < 2; hand++) {
+            if (!xr.hand_active[hand] || !xr.hud_block_valid[hand] || xr.hud_block_alpha[hand] <= 0.0f) {
+                continue;
+            }
+            const float* b = xr.hud_block[hand];
+            XrPosef pose;
+            float mpu, w_units, h_units;
+            if (!vr_wrist_panel_pose(hand, &pose, &mpu, &w_units, &h_units)) {
+                continue;
+            }
+
+            XrCompositionLayerQuad& L = wrist_layers[wrist_count++];
+            L = { XR_TYPE_COMPOSITION_LAYER_QUAD };
+            L.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            L.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            L.space = xr.local_space;
+            L.subImage.swapchain = sc.handle;
+            L.subImage.imageRect.offset = { (int32_t)(b[0] * sx), (int32_t)(b[1] * sy) };
+            L.subImage.imageRect.extent = { std::max((int32_t)((b[2] - b[0]) * sx + 0.5f), 1),
+                                            std::max((int32_t)((b[3] - b[1]) * sy + 0.5f), 1) };
+            L.subImage.imageArrayIndex = 0;
+            L.pose = pose;
+            L.size = { std::max(w_units * mpu, 0.005f), std::max(h_units * mpu, 0.005f) };
+        }
+    }
+
     // Flat-screen quad (world-locked panel with the whole 2D frame: file select, pause menu)
     XrCompositionLayerQuad screen_layer = { XR_TYPE_COMPOSITION_LAYER_QUAD };
     screen_layer.space = xr.local_space;
@@ -1755,22 +2488,105 @@ void vr_end_frame() {
         screen_layer.size = { sw, sw * 0.75f }; // 4:3, matching the swapchain
     }
 
+    // Text panel quad: only while a text box is showing (the game hands over a list only then, and
+    // never in flat-screen contexts, where text stays in the panel's frame), and only once this
+    // box's image exists. The imageRect is cropped to the region the game reported (the text box,
+    // plus the staff while the ocarina is out), so the panel IS the box: its width is the setting,
+    // its height follows the crop's aspect.
+    XrCompositionLayerQuad text_layer = { XR_TYPE_COMPOSITION_LAYER_QUAD };
+    const bool text_visible = xr.text_commands != nullptr && xr.text_has_image && xr.head_raw_valid;
+    if (text_visible) {
+        const auto& sc = xr.text_swapchain;
+        const float fw = (float)sc.width;
+        const float fh = (float)sc.height;
+        int32_t x0 = (int32_t)(std::clamp(xr.text_crop[0], 0.0f, 1.0f) * fw);
+        int32_t y0 = (int32_t)(std::clamp(xr.text_crop[1], 0.0f, 1.0f) * fh);
+        int32_t x1 = (int32_t)(std::clamp(xr.text_crop[2], 0.0f, 1.0f) * fw + 0.5f);
+        int32_t y1 = (int32_t)(std::clamp(xr.text_crop[3], 0.0f, 1.0f) * fh + 0.5f);
+        if (x1 - x0 < 8 || y1 - y0 < 8) { // degenerate report: show the whole frame
+            x0 = 0;
+            y0 = 0;
+            x1 = (int32_t)sc.width;
+            y1 = (int32_t)sc.height;
+        }
+
+        const float dt = xr.frame_state.predictedDisplayPeriod > 0
+                             ? std::min((float)((double)xr.frame_state.predictedDisplayPeriod * 1e-9), 1.0f / 30.0f)
+                             : 1.0f / (float)vr_get_refresh_rate();
+        const float tw = std::clamp(CVarGetFloat("gVrTextWidth", 0.9f), 0.2f, 3.0f);
+
+        text_layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+        text_layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+        text_layer.space = xr.local_space;
+        text_layer.subImage.swapchain = sc.handle;
+        text_layer.subImage.imageRect.offset = { x0, y0 };
+        text_layer.subImage.imageRect.extent = { x1 - x0, y1 - y0 };
+        text_layer.subImage.imageArrayIndex = 0;
+        text_layer.pose = text_panel_place(!xr.text_was_visible, dt);
+        text_layer.size = { tw, tw * (float)(y1 - y0) / (float)(x1 - x0) };
+    }
+    xr.text_was_visible = text_visible;
+
     // Assemble layers back-to-front. The projection (world) layer is only submitted once its
     // swapchains have ever been rendered (at boot we go straight into flat-screen file select).
-    const XrCompositionLayerBaseHeader* layers[3];
+    const XrCompositionLayerBaseHeader* layers[8];
     uint32_t layer_count = 0;
     if (xr.eyes_ever_rendered) {
         layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection_layer);
     }
+    // Desktop mirror: remember every quad exactly as the compositor gets it.
+    xr.mirror_quad_count = 0;
+    auto mirror_rec = [&](const XrCompositionLayerQuad& L, int src) {
+        if (xr.mirror_quad_count < 8) {
+            auto& m = xr.mirror_quads[xr.mirror_quad_count++];
+            m.src = src;
+            m.pose = L.pose;
+            m.size = L.size;
+            m.rect = L.subImage.imageRect;
+        }
+    };
     if (xr.flat_screen && xr.screen_ever_rendered) {
         layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&screen_layer);
+        mirror_rec(screen_layer, 2);
     }
     // Same guard as the projection layer: the HUD quad's swapchain is uninitialised until the
     // first HUD pass, and with per-tick HUD rendering that may be a few frames in. Also skip while
     // the game has detached the overlay (hud_commands NULL — flat-screen contexts route it into
     // the panel instead), so a stale HUD image doesn't float over the pause menu.
-    if (xr.hud_ever_rendered && xr.hud_commands != nullptr) {
+    if (hud_world) {
+        layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&hud_world_layer);
+        mirror_rec(hud_world_layer, 0);
+    } else if (xr.hud_world) {
+        // Panel requested but no HUD image this frame: show nothing rather than the wrists.
+    } else if (wrist_layout) {
+        for (uint32_t i = 0; i < wrist_count; i++) {
+            layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&wrist_layers[i]);
+            mirror_rec(wrist_layers[i], 0);
+        }
+    } else if (xr.hud_ever_rendered && xr.hud_commands != nullptr) {
         layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&hud_layer);
+        if (hud_layer.space == xr.local_space) {
+            mirror_rec(hud_layer, 0);
+        } else {
+            // Head-locked classic HUD (view space): the same offset from the mirrored eye,
+            // expressed in local space.
+            XrCompositionLayerQuad L = hud_layer;
+            const XrPosef& e = xr.submit_pose[0];
+            const glm::quat eq(e.orientation.w, e.orientation.x, e.orientation.y, e.orientation.z);
+            const glm::vec3 p = glm::vec3(e.position.x, e.position.y, e.position.z) +
+                                eq * glm::vec3(L.pose.position.x, L.pose.position.y, L.pose.position.z);
+            const glm::quat lq(L.pose.orientation.w, L.pose.orientation.x, L.pose.orientation.y,
+                               L.pose.orientation.z);
+            const glm::quat q = eq * lq;
+            L.pose.position = { p.x, p.y, p.z };
+            L.pose.orientation = { q.x, q.y, q.z, q.w };
+            mirror_rec(L, 0);
+        }
+    }
+    // Text last: it is what the player is reading, so it wins over the HUD if they ever overlap.
+    if (text_visible) {
+        layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&text_layer);
+        mirror_rec(text_layer, 1);
     }
 
     XrFrameEndInfo end_info = { XR_TYPE_FRAME_END_INFO };
@@ -1886,7 +2702,7 @@ void vr_get_view_matrix(int eye, float out[4][4]) {
     // translation.
     // The game pushes anchor + gamma at 20 fps; interpolate both to this render sub-frame with the
     // same alpha the engine uses for everything else, so the camera tracks the smooth world.
-    const glm::vec3 a = glm::mix(xr.anchor_prev, xr.anchor, xr.interp_alpha);
+    const glm::vec3 a = vr_anchor_now();
     const float g = xr.anchor_gamma_prev + (xr.anchor_gamma - xr.anchor_gamma_prev) * xr.interp_alpha;
     const float cg = cosf(g), sg = sinf(g);
 
@@ -2100,6 +2916,8 @@ void vr_apply_mode_request() {
         xr.enabled = false;
         // The overlay DL pointer goes stale immediately (graph.c stops re-arming it in flat mode).
         xr.hud_commands = nullptr;
+        xr.text_commands = nullptr;
+        xr.text_has_image = false;
         // Stale hand kinematics/sim state must not leak across a disable -> re-enable gap.
         vrphys_reset();
     } else if (!xr.enabled) {
@@ -2232,7 +3050,7 @@ bool vr_get_hand_pose(int hand, float out_pos[3], float out_quat[4]) {
     }
     const XrPosef p = vr_effective_grip_pose(hand);
     const glm::vec3 anchor = (xr.first_person && xr.anchor_initialized)
-                                 ? glm::mix(xr.anchor_prev, xr.anchor, xr.interp_alpha)
+                                 ? vr_anchor_now()
                                  : glm::vec3(0.0f);
     out_pos[0] = anchor.x + p.position.x * xr.world_scale;
     out_pos[1] = anchor.y + p.position.y * xr.world_scale;
@@ -2260,7 +3078,7 @@ bool vr_get_aim_ray(int hand, float out_pos[3], float out_dir[3]) {
     }
     const XrPosef& p = xr.aim_pose[hand];
     const glm::vec3 anchor = (xr.first_person && xr.anchor_initialized)
-                                 ? glm::mix(xr.anchor_prev, xr.anchor, xr.interp_alpha)
+                                 ? vr_anchor_now()
                                  : glm::vec3(0.0f);
     glm::quat q(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z);
 
@@ -2311,6 +3129,52 @@ void vr_set_stick_suppressed(int hand, bool suppressed) {
     if (hand >= 0 && hand <= 1) {
         g_stick_suppressed[hand] = suppressed;
     }
+}
+
+void vr_set_turn_suppressed(bool suppressed) {
+    g_turn_suppressed = suppressed;
+}
+
+void vr_set_climb_view_lock(int hand, const float ref_units[3], const float wall_normal[3], bool lateral) {
+    if (hand < 0 || hand > 1 || ref_units == nullptr) {
+        if (g_climb_hand >= 0 && xr.first_person && xr.hand_active[g_climb_hand]) {
+            g_climb_handoff_anchor = vr_climb_locked_anchor();
+            g_climb_handoff_t0 = std::chrono::steady_clock::now();
+            g_climb_handoff_active = true;
+        }
+        g_climb_hand = -1;
+        g_climb_lim_valid = false;
+        g_climb_frozen = false;
+        g_climb_prev_valid = false;
+        return;
+    }
+    g_climb_handoff_active = false;
+    if (g_climb_hand != hand) {
+        g_climb_prev_valid = false;
+        g_climb_last_body = glm::vec3(0.0f);
+    }
+    // A fresh ref from the game (it re-bases after a discontinuity) releases a frozen view.
+    g_climb_frozen = false;
+    g_climb_hand = hand;
+    g_climb_ref = glm::vec3(ref_units[0], ref_units[1], ref_units[2]);
+    g_climb_normal = wall_normal != nullptr ? glm::vec3(wall_normal[0], wall_normal[1], wall_normal[2])
+                                            : glm::vec3(0.0f);
+    const float len = glm::length(g_climb_normal);
+    g_climb_normal = len > 1e-4f ? g_climb_normal / len : glm::vec3(0.0f);
+    g_climb_lateral = lateral;
+}
+
+bool vr_get_hand_tracked(int hand, float out_units[3]) {
+    out_units[0] = out_units[1] = out_units[2] = 0.0f;
+    if (hand < 0 || hand > 1 || !xr.initialized || !xr.input_initialized || !xr.hand_active[hand] ||
+        !xr.hand_tracked[hand]) {
+        return false;
+    }
+    const XrVector3f& p = xr.grip_pose[hand].position;
+    out_units[0] = p.x * xr.world_scale;
+    out_units[1] = p.y * xr.world_scale;
+    out_units[2] = p.z * xr.world_scale;
+    return true;
 }
 
 float vr_get_trigger(int hand) {
@@ -2365,7 +3229,7 @@ bool vr_get_hand_matrix(int hand, float out[4][4]) {
     }
     const XrPosef p = vr_effective_grip_pose(hand);
     const glm::vec3 anchor = (xr.first_person && xr.anchor_initialized)
-                                 ? glm::mix(xr.anchor_prev, xr.anchor, xr.interp_alpha)
+                                 ? vr_anchor_now()
                                  : glm::vec3(0.0f);
     const glm::vec3 world_pos(anchor.x + p.position.x * xr.world_scale,
                               anchor.y + p.position.y * xr.world_scale,
@@ -2489,7 +3353,7 @@ bool vr_get_head_matrix(float out[4][4]) {
     glm::vec3 anchor(0.0f);
     float g = 0.0f;
     if (xr.anchor_initialized) {
-        anchor = glm::mix(xr.anchor_prev, xr.anchor, xr.interp_alpha);
+        anchor = vr_anchor_now();
         g = xr.anchor_gamma_prev + (xr.anchor_gamma - xr.anchor_gamma_prev) * xr.interp_alpha;
     }
     // Undo the view's RowRotY(gamma): v -> (x cg - z sg, y, x sg + z cg) (see vr_get_camera_pose).
@@ -2623,6 +3487,17 @@ void vr_set_view_fade(float fade) {
     xr.view_fade_target = fminf(fmaxf(fade, 0.0f), 1.0f);
 }
 
+void vr_clear_current_eye_depth() {
+    if (!xr.initialized || !xr.frame_began || xr.rendering_screen || xr.rendering_text || xr.rendering_hud) {
+        return;
+    }
+    auto& sc = xr.eye_swapchains[xr.current_eye];
+    ID3D11DepthStencilView* dsv = sc.dsvs[xr.current_image_index[xr.current_eye]].Get();
+    if (dsv != nullptr) {
+        xr.d3d_context->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
+    }
+}
+
 void vr_rebind_current_eye_target() {
     if (!xr.initialized || !xr.frame_began) return;
 
@@ -2636,6 +3511,11 @@ void vr_rebind_current_eye_target() {
         auto& sc = xr.screen_swapchain;
         rtv = sc.rtvs[xr.screen_image_index].Get();
         dsv = sc.dsvs[xr.screen_image_index].Get();
+        height = sc.height;
+    } else if (xr.rendering_text) {
+        auto& sc = xr.text_swapchain;
+        rtv = sc.rtvs[xr.text_image_index].Get();
+        dsv = sc.dsvs[xr.text_image_index].Get();
         height = sc.height;
     } else if (xr.rendering_hud) {
         auto& sc = xr.hud_swapchain;
@@ -2657,8 +3537,406 @@ void vr_rebind_current_eye_target() {
 // HUD overlay
 // --------------------------------------------------------------------------
 
+// Keep a readable copy of a 2D layer's image for the desktop mirror (call while still acquired).
+static void vr_copy_layer_image(int slot, ID3D11Texture2D* src) {
+    if (src == nullptr) {
+        return;
+    }
+    auto& c = xr.layer_copy[slot];
+    D3D11_TEXTURE2D_DESC sd;
+    src->GetDesc(&sd);
+    if (!c.tex || c.w != sd.Width || c.h != sd.Height) {
+        D3D11_TEXTURE2D_DESC d = sd;
+        d.MipLevels = 1;
+        d.ArraySize = 1;
+        d.SampleDesc.Count = 1;
+        d.SampleDesc.Quality = 0;
+        d.Usage = D3D11_USAGE_DEFAULT;
+        d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        d.CPUAccessFlags = 0;
+        d.MiscFlags = 0;
+        c.srv.Reset();
+        c.tex.Reset();
+        if (FAILED(xr.d3d_device->CreateTexture2D(&d, nullptr, c.tex.GetAddressOf()))) {
+            c.tex.Reset();
+            return;
+        }
+        D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+        srv_desc.Format = xr.view_format;
+        srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srv_desc.Texture2D.MipLevels = 1;
+        if (FAILED(xr.d3d_device->CreateShaderResourceView(c.tex.Get(), &srv_desc, c.srv.GetAddressOf()))) {
+            c.srv.Reset();
+            c.tex.Reset();
+            return;
+        }
+        c.w = sd.Width;
+        c.h = sd.Height;
+    }
+    xr.d3d_context->CopyResource(c.tex.Get(), src);
+}
+
 void vr_set_hud_commands(void* commands) { xr.hud_commands = commands; }
 void* vr_get_hud_commands() { return xr.hud_commands; }
+
+// Wrist layout (default) vs the classic single HUD quad (head-locked or one hand, gVrHudAttach).
+static bool vr_hud_wrist_layout() {
+    return CVarGetInteger("gVrHudLayout", 0) == 0;
+}
+
+// Which wrist an element lives on: 0 = left controller, 1 = right, -1 = none.
+static int vr_hud_el_hand(int el) {
+    switch (el) {
+        case VR_HUD_EL_HEARTS:
+        case VR_HUD_EL_MAGIC:
+        case VR_HUD_EL_RUPEES:
+        case VR_HUD_EL_KEYS:
+        case VR_HUD_EL_TIMER:
+        case VR_HUD_EL_GAME_TIMER:
+            return 0;
+        case VR_HUD_EL_BTN_B:
+        case VR_HUD_EL_BTN_A:
+        case VR_HUD_EL_BTN_C_LEFT:
+        case VR_HUD_EL_BTN_C_DOWN:
+        case VR_HUD_EL_BTN_C_RIGHT:
+        case VR_HUD_EL_BTN_C_UP:
+        case VR_HUD_EL_BTN_DPAD:
+        case VR_HUD_EL_MOUNT:
+        case VR_HUD_EL_MINIMAP:
+            return 1;
+        default:
+            return -1;
+    }
+}
+
+// The wrist canvases: each hand gets its own region of the HUD image (left half / right half of
+// the 320x240 frame) and its elements are laid out there in rows, top to bottom, left to right,
+// each row's elements centred on the row's height; then every element moves by its own offset
+// and size from the settings (vr_hud_settings.h, per Adult / Child profile). -1 ends a row, -2
+// ends the hand.
+//   LEFT : hearts / magic / rupees, keys / timers
+//   RIGHT: the B / A / C button cluster in vanilla's arrangement / D-pad, carrots-or-archery / minimap
+// Layout runs in LAYOUT UNITS (1 = a native HUD pixel at 100% size); the canvas is packed into
+// the image at kWristPack native px per unit, which doubles the room per hand (the HUD swapchain
+// doubled in resolution to match, so elements are exactly as sharp as before).
+static const int kWristRows[2][16] = {
+    { VR_HUD_EL_HEARTS, -1, VR_HUD_EL_MAGIC, -1, VR_HUD_EL_RUPEES, VR_HUD_EL_KEYS, -1, VR_HUD_EL_TIMER,
+      VR_HUD_EL_GAME_TIMER, -2 },
+    { -3, VR_HUD_EL_BTN_DPAD, VR_HUD_EL_MOUNT, -1, VR_HUD_EL_MINIMAP, -2 }, // -3 = the button cluster
+};
+static constexpr float kWristCanvasH = 240.0f;
+static constexpr float kWristRegionW = kWristCanvasW / kWristPack; // layout units per hand
+static constexpr float kWristRegionH = kWristCanvasH / kWristPack;
+static constexpr float kWristGap = 3.0f;                    // between auto-laid-out elements, units
+
+// The settings profile in effect: Link's age, unless the menu forces one for preview.
+static int vr_hud_profile() {
+    const int preview = CVarGetInteger("gVrHud.Preview", 0);
+    if (preview == 1) {
+        return 0;
+    }
+    if (preview == 2) {
+        return 1;
+    }
+    return xr.hud_child ? 1 : 0;
+}
+
+static float vr_hud_panel_f(int child, int hand, const char* field, float def) {
+    char name[96];
+    VrHudPanelCVar(name, sizeof(name), child, hand, field);
+    return CVarGetFloat(name, def);
+}
+
+void vr_set_hud_child(bool child) {
+    xr.hud_child = child;
+}
+
+bool vr_get_hud_child() {
+    return xr.hud_child;
+}
+
+void vr_hud_marker(uint32_t w1) {
+    int el = (int)(w1 & 0xFF);
+    if (el >= VR_HUD_EL_COUNT) {
+        el = VR_HUD_EL_NONE;
+    }
+    xr.hud_el = el;
+    const uint8_t alpha = (uint8_t)((w1 >> 16) & 0xFF);
+    if (alpha > xr.hud_meas_alpha[el]) {
+        xr.hud_meas_alpha[el] = alpha;
+    }
+}
+
+void vr_set_hud_world_panel(bool enabled, const float center[3], float yaw, float width, float height) {
+    xr.hud_world = enabled;
+    if (enabled) {
+        xr.hud_world_center = glm::vec3(center[0], center[1], center[2]);
+        xr.hud_world_yaw = yaw;
+        xr.hud_world_size[0] = width;
+        xr.hud_world_size[1] = height;
+    }
+}
+
+// out = { s, ox, oy }: the interpreter writes x' = s x + ox w, y' = s y + oy w (clip space), which
+// maps the element's TV extent origin r0 to its slot A (native px, y down) at scale s:
+// X' = A + (X - r0) s with X = (ndc + 1) 160, Y = (1 - ndc) 120.
+bool vr_hud_tri(const float ndc[6], float out[3]) {
+    const int el = xr.hud_el;
+    out[0] = 1.0f;
+    out[1] = out[2] = 0.0f;
+    if (xr.hud_world_pass) {
+        // The pause frame: every HUD element at its TV position (vitals, buttons with Return /
+        // Save / Decide, the equip fly-in). Nothing measured: the wrists keep their layout.
+        return el != VR_HUD_EL_NONE && el != VR_HUD_EL_OTHER;
+    }
+    if (vr_hud_el_hand(el) < 0) {
+        return false;
+    }
+    // Entirely off-frame (SoH's "hidden" cosmetic position is -9999; rects skip clip rejection):
+    // invisible anyway, and it must not stretch the element's extent to the frame edge.
+    if ((ndc[0] < -1.0f && ndc[2] < -1.0f && ndc[4] < -1.0f) || (ndc[0] > 1.0f && ndc[2] > 1.0f && ndc[4] > 1.0f) ||
+        (ndc[1] < -1.0f && ndc[3] < -1.0f && ndc[5] < -1.0f) || (ndc[1] > 1.0f && ndc[3] > 1.0f && ndc[5] > 1.0f)) {
+        return false;
+    }
+    // Measure on the TV layout (native px, the untouched position).
+    float* m = xr.hud_meas[el];
+    for (int i = 0; i < 3; i++) {
+        const float x = std::clamp((ndc[i * 2] + 1.0f) * 160.0f, 0.0f, 320.0f);
+        const float y = std::clamp((1.0f - ndc[i * 2 + 1]) * 120.0f, 0.0f, 240.0f);
+        if (!xr.hud_meas_any[el]) {
+            m[0] = m[2] = x;
+            m[1] = m[3] = y;
+            xr.hud_meas_any[el] = true;
+        } else {
+            m[0] = std::min(m[0], x);
+            m[1] = std::min(m[1], y);
+            m[2] = std::max(m[2], x);
+            m[3] = std::max(m[3], y);
+        }
+    }
+    // Draw it in its slot. Not placed (first pass it ever drew, or hidden in the settings): no draw.
+    if (!xr.hud_placed[el] || !xr.hud_rect_valid[el]) {
+        return false;
+    }
+    const float s = xr.hud_slot[el][2];
+    const float* r0 = xr.hud_rect[el];
+    out[0] = s;
+    out[1] = (xr.hud_slot[el][0] - r0[0] * s) / 160.0f + s - 1.0f;
+    out[2] = 1.0f - s - (xr.hud_slot[el][1] - r0[1] * s) / 120.0f;
+    return true;
+}
+
+// Fold this pass's measurements into the held extents, then lay both canvases out for the next pass.
+static void vr_hud_latch_and_layout() {
+    for (int el = 0; el < VR_HUD_EL_COUNT; el++) {
+        if (vr_hud_el_hand(el) < 0) {
+            continue;
+        }
+        if (!xr.hud_meas_any[el]) {
+            // Not drawn: keep its slot for a while (the Navi prompt blinks, a one-tick gap mustn't
+            // reflow the layout), then drop it out of the layout.
+            if (++xr.hud_absent_passes[el] > 30) {
+                xr.hud_rect_valid[el] = false;
+                xr.hud_alpha[el] = 0.0f;
+            }
+            continue;
+        }
+        xr.hud_absent_passes[el] = 0;
+        xr.hud_alpha[el] = xr.hud_meas_alpha[el] / 255.0f;
+
+        const float* meas = xr.hud_meas[el];
+        float* r = xr.hud_rect[el];
+        if (!xr.hud_rect_valid[el]) {
+            memcpy(r, meas, sizeof(float) * 4);
+            xr.hud_rect_valid[el] = true;
+            xr.hud_shrink_passes[el] = 0;
+            continue;
+        }
+        const bool grows = meas[0] < r[0] || meas[1] < r[1] || meas[2] > r[2] || meas[3] > r[3];
+        const float slack = 1.5f;
+        const bool smaller = meas[0] > r[0] + slack || meas[1] > r[1] + slack || meas[2] < r[2] - slack ||
+                             meas[3] < r[3] - slack;
+        if (grows) {
+            r[0] = std::min(r[0], meas[0]);
+            r[1] = std::min(r[1], meas[1]);
+            r[2] = std::max(r[2], meas[2]);
+            r[3] = std::max(r[3], meas[3]);
+            xr.hud_shrink_passes[el] = 0;
+        } else if (smaller) {
+            // ~1.5 s of HUD passes at 20 Hz: a lost heart container or 3 -> 2 digit rupees settles,
+            // the low-health heart beat never gets the chance.
+            if (++xr.hud_shrink_passes[el] > 30) {
+                memcpy(r, meas, sizeof(float) * 4);
+                xr.hud_shrink_passes[el] = 0;
+            }
+        } else {
+            xr.hud_shrink_passes[el] = 0;
+        }
+    }
+
+    const int child = vr_hud_profile();
+    for (int hand = 0; hand < 2; hand++) {
+        const VrHudPanelDefaults& pd = kVrHudPanelDefaults[child][hand];
+        const float pad = std::clamp(vr_hud_panel_f(child, hand, "Padding", pd.padding), 0.0f, 100.0f);
+
+        // Per element settings for this hand: size, offset, visibility.
+        float el_scale[VR_HUD_EL_COUNT];
+        float el_off[VR_HUD_EL_COUNT][2];
+        bool el_show[VR_HUD_EL_COUNT];
+        for (int el = 0; el < VR_HUD_EL_COUNT; el++) {
+            el_scale[el] = 1.0f;
+            el_off[el][0] = el_off[el][1] = 0.0f;
+            el_show[el] = true;
+            const VrHudElementDesc* d = VrHudElementById(el);
+            if (d == nullptr) {
+                continue;
+            }
+            char name[96];
+            VrHudElementCVar(name, sizeof(name), child, d->key, "Scale");
+            el_scale[el] = std::clamp(CVarGetFloat(name, d->scale[child]), 10.0f, 500.0f) / 100.0f;
+            VrHudElementCVar(name, sizeof(name), child, d->key, "X");
+            el_off[el][0] = CVarGetFloat(name, d->x[child]);
+            VrHudElementCVar(name, sizeof(name), child, d->key, "Y");
+            el_off[el][1] = CVarGetFloat(name, d->y[child]);
+            VrHudElementCVar(name, sizeof(name), child, d->key, "Show");
+            el_show[el] = CVarGetInteger(name, d->show[child]) != 0;
+        }
+
+        // Auto layout in layout units (rows, wrapping at the region edge), then each element's
+        // own offset on top; everything is kept inside this hand's region of the image.
+        float y = pad;
+        float max_x = 0.0f, max_y = 0.0f;
+        float block_alpha = 0.0f;
+        bool any = false;
+        int row[16];
+        int row_n = 0;
+        auto el_w = [&](int el) { return (xr.hud_rect[el][2] - xr.hud_rect[el][0]) * el_scale[el]; };
+        auto el_h = [&](int el) { return (xr.hud_rect[el][3] - xr.hud_rect[el][1]) * el_scale[el]; };
+        auto flush_row = [&]() {
+            if (row_n == 0) {
+                return;
+            }
+            float row_h = 0.0f;
+            for (int k = 0; k < row_n; k++) {
+                row_h = std::max(row_h, el_h(row[k]));
+            }
+            float x = pad;
+            for (int k = 0; k < row_n; k++) {
+                const int el = row[k];
+                const float w = el_w(el);
+                const float h = el_h(el);
+                float fx = x + el_off[el][0];
+                float fy = y + (row_h - h) * 0.5f + el_off[el][1];
+                fx = std::clamp(fx, 0.0f, std::max(kWristRegionW - w, 0.0f));
+                fy = std::clamp(fy, 0.0f, std::max(kWristRegionH - h, 0.0f));
+                xr.hud_slot[el][0] = hand * kWristCanvasW + fx * kWristPack;
+                xr.hud_slot[el][1] = fy * kWristPack;
+                xr.hud_slot[el][2] = el_scale[el] * kWristPack;
+                xr.hud_placed[el] = true;
+                max_x = std::max(max_x, fx + w);
+                max_y = std::max(max_y, fy + h);
+                x += w + kWristGap;
+            }
+            y += row_h + kWristGap;
+            row_n = 0;
+        };
+
+        // The B / A / C cluster: every button keeps its TV position relative to the others
+        // (vanilla's arrangement, as in SoH's HUD editor). All of them sit at their constant +
+        // the same right-edge shift (OTRGetDimensionFromRightEdge with the eye's aspect, which is
+        // what the game laid them out with), so one fixed reference moves the cluster rigidly;
+        // labels changing width never shift it. 8 units of room to the left for the B label.
+        auto place_cluster = [&]() {
+            static const int kCluster[6] = { VR_HUD_EL_BTN_B, VR_HUD_EL_BTN_A, VR_HUD_EL_BTN_C_UP,
+                                             VR_HUD_EL_BTN_C_LEFT, VR_HUD_EL_BTN_C_DOWN, VR_HUD_EL_BTN_C_RIGHT };
+            const auto& eye0 = xr.eye_swapchains[0];
+            const float aspect = (eye0.width > 0 && eye0.height > 0) ? (float)eye0.width / eye0.height : 1.0f;
+            const float shift = 120.0f * aspect - 160.0f;
+            const float ref_x = kVrHudClusterRefX + shift - 8.0f;
+            const float ref_y = kVrHudClusterRefY - 2.0f;
+            float bottom = y;
+            bool placed_any = false;
+            for (int el : kCluster) {
+                if (!xr.hud_rect_valid[el] || !el_show[el]) {
+                    xr.hud_placed[el] = false;
+                    continue;
+                }
+                const float w = el_w(el);
+                const float h = el_h(el);
+                float fx = pad + (xr.hud_rect[el][0] - ref_x) + el_off[el][0];
+                float fy = y + (xr.hud_rect[el][1] - ref_y) + el_off[el][1];
+                fx = std::clamp(fx, 0.0f, std::max(kWristRegionW - w, 0.0f));
+                fy = std::clamp(fy, 0.0f, std::max(kWristRegionH - h, 0.0f));
+                xr.hud_slot[el][0] = hand * kWristCanvasW + fx * kWristPack;
+                xr.hud_slot[el][1] = fy * kWristPack;
+                xr.hud_slot[el][2] = el_scale[el] * kWristPack;
+                xr.hud_placed[el] = true;
+                max_x = std::max(max_x, fx + w);
+                max_y = std::max(max_y, fy + h);
+                bottom = std::max(bottom, fy + h);
+                placed_any = true;
+                any = true;
+                block_alpha = std::max(block_alpha, xr.hud_alpha[el]);
+            }
+            if (placed_any) {
+                y = bottom + kWristGap;
+            }
+        };
+
+        for (int k = 0; k < 16 && kWristRows[hand][k] != -2; k++) {
+            const int el = kWristRows[hand][k];
+            if (el == -1) {
+                flush_row();
+                continue;
+            }
+            if (el == -3) {
+                flush_row();
+                place_cluster();
+                continue;
+            }
+            if (!xr.hud_rect_valid[el] || !el_show[el]) {
+                xr.hud_placed[el] = false;
+                continue;
+            }
+            float row_w = pad;
+            for (int j = 0; j < row_n; j++) {
+                row_w += el_w(row[j]) + kWristGap;
+            }
+            if (row_n > 0 && row_w + el_w(el) > kWristRegionW - pad) {
+                flush_row();
+            }
+            row[row_n++] = el;
+            any = true;
+            block_alpha = std::max(block_alpha, xr.hud_alpha[el]);
+        }
+        flush_row();
+
+        // The card: fitted to the elements plus padding, or the size set in the settings.
+        float card_w = vr_hud_panel_f(child, hand, "Width", pd.width);
+        float card_h = vr_hud_panel_f(child, hand, "Height", pd.height);
+        if (card_w <= 0.0f) {
+            card_w = max_x + pad;
+        }
+        if (card_h <= 0.0f) {
+            card_h = max_y + pad;
+        }
+        card_w = std::clamp(card_w, 4.0f, kWristRegionW);
+        card_h = std::clamp(card_h, 4.0f, kWristRegionH);
+
+        xr.hud_block_valid[hand] = any;
+        if (any) {
+            xr.hud_block[hand][0] = hand * kWristCanvasW;
+            xr.hud_block[hand][1] = 0.0f;
+            xr.hud_block[hand][2] = hand * kWristCanvasW + card_w * kWristPack;
+            xr.hud_block[hand][3] = card_h * kWristPack;
+        }
+        xr.hud_block_alpha[hand] = block_alpha;
+    }
+}
+
+bool vr_wants_coverage_blend() {
+    return xr.rendering_text || (xr.rendering_hud && !xr.rendering_screen);
+}
 
 void vr_begin_hud() {
     if (!xr.initialized) return;
@@ -2683,6 +3961,35 @@ void vr_begin_hud() {
     xr.d3d_context->ClearRenderTargetView(rtv, clear_color);
     xr.d3d_context->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
 
+    // Wrist layout: paint each hand canvas's dark backing (premultiplied translucent black, faded
+    // with its elements) over the laid-out block BEFORE the elements draw into their slots on it.
+    xr.hud_world_pass = xr.hud_world;
+    g_vr_hud_layout_pass = xr.hud_world_pass || vr_hud_wrist_layout();
+    xr.hud_el = VR_HUD_EL_NONE;
+    if (g_vr_hud_layout_pass && !xr.hud_world_pass) {
+        const int child = vr_hud_profile();
+        const float sx = sc.width / 320.0f, sy = sc.height / 240.0f;
+        for (int hand = 0; hand < 2; hand++) {
+            const float backing = std::clamp(
+                vr_hud_panel_f(child, hand, "Backing", kVrHudPanelDefaults[child][hand].backing) / 100.0f, 0.0f, 1.0f);
+            if (!xr.d3d_context1 || !xr.hud_block_valid[hand] || backing <= 0.0f) {
+                continue;
+            }
+            const float* b = xr.hud_block[hand];
+            const D3D11_RECT rect = { (LONG)(b[0] * sx), (LONG)(b[1] * sy), (LONG)(b[2] * sx + 0.5f),
+                                      (LONG)(b[3] * sy + 0.5f) };
+            // In-headset editing: tint the card while a hand is in reach (blue) / holding it.
+            const float a = std::max(backing * xr.hud_block_alpha[hand], xr.grab.hover[hand] ? 0.6f : 0.0f);
+            const float tint = xr.grab.hover[hand] == 2 ? 0.35f : (xr.grab.hover[hand] == 1 ? 0.18f : 0.0f);
+            const float dark[4] = { 0.0f, tint * 0.4f * a, tint * a, a };
+            xr.d3d_context1->ClearView(rtv, dark, &rect, 1);
+        }
+        for (int el = 0; el < VR_HUD_EL_COUNT; el++) {
+            xr.hud_meas_any[el] = false;
+            xr.hud_meas_alpha[el] = 0;
+        }
+    }
+
     D3D11_VIEWPORT viewport = {};
     viewport.Width = static_cast<float>(sc.width);
     viewport.Height = static_cast<float>(sc.height);
@@ -2697,6 +4004,15 @@ void vr_begin_hud() {
 void vr_end_hud() {
     if (!xr.initialized) return;
     xr.rendering_hud = false;
+    if (g_vr_hud_layout_pass) {
+        g_vr_hud_layout_pass = false;
+        if (!xr.hud_world_pass) {
+            vr_hud_latch_and_layout();
+        }
+    }
+    xr.hud_world_pass = false;
+
+    vr_copy_layer_image(0, xr.hud_swapchain.images[xr.hud_image_index].texture); // desktop mirror
 
     XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
     xr_check(xrReleaseSwapchainImage(xr.hud_swapchain.handle, &release_info), "xrReleaseSwapchainImage (HUD)");
@@ -2707,6 +4023,74 @@ void vr_end_hud() {
 bool vr_is_rendering_hud() { return xr.rendering_hud; }
 
 bool vr_is_rendering_screen() { return xr.rendering_screen; }
+
+// --------------------------------------------------------------------------
+// Text panel (message system on its own soft-follow quad)
+// --------------------------------------------------------------------------
+
+void vr_set_text_commands(void* commands, const float crop[4]) {
+    if (commands == nullptr) {
+        // Box closed: the next one starts from a blank image and snaps into place.
+        xr.text_has_image = false;
+    }
+    xr.text_commands = commands;
+    for (int i = 0; i < 4; i++) {
+        xr.text_crop[i] = crop[i];
+    }
+}
+
+void* vr_get_text_commands() { return xr.text_commands; }
+
+// Same 2D pass as the HUD (rendering_hud keeps the game's flat projection), into the text swapchain.
+void vr_begin_text() {
+    if (!xr.initialized) return;
+    xr.rendering_hud = true;
+    xr.rendering_text = true;
+    xr.text_has_image = true;
+
+    auto& sc = xr.text_swapchain;
+    XrSwapchainImageAcquireInfo acquire_info = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+    uint32_t image_index = 0;
+    xr_check(xrAcquireSwapchainImage(sc.handle, &acquire_info, &image_index), "xrAcquireSwapchainImage (text)");
+    xr.text_image_index = image_index;
+
+    XrSwapchainImageWaitInfo wait_info = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+    wait_info.timeout = XR_INFINITE_DURATION;
+    xr_check(xrWaitSwapchainImage(sc.handle, &wait_info), "xrWaitSwapchainImage (text)");
+
+    ID3D11RenderTargetView* rtv = sc.rtvs[image_index].Get();
+    ID3D11DepthStencilView* dsv = sc.dsvs[image_index].Get();
+    xr.d3d_context->OMSetRenderTargets(1, &rtv, dsv);
+
+    float clear_color[] = { 0.0f, 0.0f, 0.0f, 0.0f }; // Transparent
+    xr.d3d_context->ClearRenderTargetView(rtv, clear_color);
+    xr.d3d_context->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
+
+    D3D11_VIEWPORT viewport = {};
+    viewport.Width = static_cast<float>(sc.width);
+    viewport.Height = static_cast<float>(sc.height);
+    viewport.MinDepth = 0.0f;
+    viewport.MaxDepth = 1.0f;
+    xr.d3d_context->RSSetViewports(1, &viewport);
+
+    gfx_d3d11_set_render_target_height(sc.height);
+    vr_apply_dimensions(sc.width, sc.height);
+}
+
+void vr_end_text() {
+    if (!xr.initialized) return;
+    xr.rendering_hud = false;
+    xr.rendering_text = false;
+
+    vr_copy_layer_image(1, xr.text_swapchain.images[xr.text_image_index].texture); // desktop mirror
+
+    XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+    xr_check(xrReleaseSwapchainImage(xr.text_swapchain.handle, &release_info), "xrReleaseSwapchainImage (text)");
+
+    vr_restore_eye_dimensions();
+}
+
+bool vr_is_rendering_text() { return xr.rendering_text; }
 
 // --------------------------------------------------------------------------
 // Flat-screen mode (whole frame on a floating panel: file select, pause menu)
@@ -2762,6 +4146,8 @@ void vr_end_screen() {
     xr.rendering_hud = false;
     xr.rendering_screen = false;
 
+    vr_copy_layer_image(2, xr.screen_swapchain.images[xr.screen_image_index].texture); // desktop mirror
+
     XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
     xr_check(xrReleaseSwapchainImage(xr.screen_swapchain.handle, &release_info), "xrReleaseSwapchainImage (screen)");
 
@@ -2774,6 +4160,9 @@ void vr_get_2d_target_size(uint32_t* w, uint32_t* h) {
     if (xr.rendering_screen) {
         *w = xr.screen_swapchain.width;
         *h = xr.screen_swapchain.height;
+    } else if (xr.rendering_text) {
+        *w = xr.text_swapchain.width;
+        *h = xr.text_swapchain.height;
     } else {
         *w = xr.hud_swapchain.width;
         *h = xr.hud_swapchain.height;
@@ -2797,6 +4186,59 @@ void vr_capture_mirror() {
         // straight resource copy is valid (no shader blit needed).
         xr.d3d_context->CopyResource(xr.mirror_texture.Get(), src);
     }
+}
+
+// The headset's quad layers as the desktop mirror (the left eye) sees them: each quad as a grid of
+// projected points (0..1 across the mirror image) with its texture and UV rect, so the companion
+// window can draw it in perspective over the mirror (it is a compositor layer the eye image never
+// contains). Projected through the pose + FOV the mirrored eye image was rendered with.
+int vr_get_mirror_quads(VrMirrorQuad* out, int max) {
+    if (!xr.initialized || !xr.enabled) {
+        return 0;
+    }
+    const XrPosef& e = xr.submit_pose[0];
+    const XrFovf& f = xr.submit_fov[0];
+    const glm::quat eq_inv =
+        glm::inverse(glm::quat(e.orientation.w, e.orientation.x, e.orientation.y, e.orientation.z));
+    const glm::vec3 ep(e.position.x, e.position.y, e.position.z);
+    const float tl = tanf(f.angleLeft), tr = tanf(f.angleRight), tu = tanf(f.angleUp), td = tanf(f.angleDown);
+    if (tr - tl < 1e-4f || tu - td < 1e-4f) {
+        return 0;
+    }
+    int n = 0;
+    for (int i = 0; i < xr.mirror_quad_count && n < max; i++) {
+        const auto& m = xr.mirror_quads[i];
+        const auto& c = xr.layer_copy[m.src];
+        if (!c.srv || c.w == 0 || c.h == 0) {
+            continue;
+        }
+        VrMirrorQuad& o = out[n++];
+        o.srv = c.srv.Get();
+        o.uv[0] = (float)m.rect.offset.x / c.w;
+        o.uv[1] = (float)m.rect.offset.y / c.h;
+        o.uv[2] = (float)(m.rect.offset.x + m.rect.extent.width) / c.w;
+        o.uv[3] = (float)(m.rect.offset.y + m.rect.extent.height) / c.h;
+        const glm::quat q(m.pose.orientation.w, m.pose.orientation.x, m.pose.orientation.y, m.pose.orientation.z);
+        const glm::vec3 p(m.pose.position.x, m.pose.position.y, m.pose.position.z);
+        for (int ix = 0; ix < VR_MIRROR_GRID; ix++) {
+            for (int iy = 0; iy < VR_MIRROR_GRID; iy++) {
+                // Image top-left = the quad's (-x, +y) corner.
+                const float sx = (float)ix / (VR_MIRROR_GRID - 1) - 0.5f;
+                const float sy = 0.5f - (float)iy / (VR_MIRROR_GRID - 1);
+                const glm::vec3 w = p + q * glm::vec3(sx * m.size.width, sy * m.size.height, 0.0f);
+                const glm::vec3 d = eq_inv * (w - ep);
+                if (d.z > -0.01f) {
+                    o.ok[ix][iy] = false;
+                    continue;
+                }
+                const float tx = d.x / -d.z, ty = d.y / -d.z;
+                o.pt[ix][iy][0] = (tx - tl) / (tr - tl);
+                o.pt[ix][iy][1] = (tu - ty) / (tu - td);
+                o.ok[ix][iy] = true;
+            }
+        }
+    }
+    return n;
 }
 
 void* vr_get_mirror_texture_id() {
@@ -2867,6 +4309,15 @@ bool vr_get_hand_pose(int, float out_pos[3], float out_quat[4]) {
 bool vr_is_hand_active(int) { return false; }
 uint16_t vr_get_controller_buttons(int) { return 0; }
 void vr_get_thumbstick(int, float* x, float* y) { *x = *y = 0.0f; }
+void vr_set_turn_suppressed(bool) {}
+void vr_set_climb_view_lock(int, const float*, const float*, bool) {}
+void vr_request_face_yaw(int16_t) {}
+void vr_set_climb_view_limits(const float*, const float*, const float*) {}
+bool vr_consume_climb_discontinuity() { return false; }
+bool vr_get_hand_tracked(int, float out_units[3]) {
+    out_units[0] = out_units[1] = out_units[2] = 0.0f;
+    return false;
+}
 float vr_get_trigger(int) { return 0.0f; }
 float vr_get_grip(int) { return 0.0f; }
 bool vr_get_hand_matrix(int, float out[4][4]) {
@@ -2900,11 +4351,23 @@ void vr_set_lockon_yaw(int16_t, bool) {}
 void vr_recenter_heading(int16_t) {}
 void vr_set_interp_alpha(float) {}
 void vr_rebind_current_eye_target() {}
+void vr_clear_current_eye_depth() {}
 void vr_set_hud_commands(void*) {}
 void* vr_get_hud_commands() { return nullptr; }
 void vr_begin_hud() {}
 void vr_end_hud() {}
 bool vr_is_rendering_hud() { return false; }
+void vr_set_text_commands(void*, const float*) {}
+void* vr_get_text_commands() { return nullptr; }
+void vr_begin_text() {}
+void vr_end_text() {}
+bool vr_is_rendering_text() { return false; }
+bool vr_wants_coverage_blend() { return false; }
+void vr_hud_marker(uint32_t) {}
+void vr_set_hud_world_panel(bool, const float*, float, float, float) {}
+bool vr_hud_tri(const float*, float* out) { out[0] = 1.0f; out[1] = out[2] = 0.0f; return true; }
+void vr_set_hud_child(bool) {}
+bool vr_get_hud_child() { return false; }
 bool vr_is_rendering_screen() { return false; }
 void vr_set_flat_screen(bool) {}
 bool vr_get_flat_screen() { return false; }
@@ -2913,5 +4376,6 @@ void vr_end_screen() {}
 void vr_get_2d_target_size(uint32_t* w, uint32_t* h) { *w = 1024; *h = 768; }
 void vr_capture_mirror() {}
 void* vr_get_mirror_texture_id() { return nullptr; }
+int vr_get_mirror_quads(VrMirrorQuad*, int) { return 0; }
 
 #endif

@@ -1806,6 +1806,19 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         return;
     }
 
+    // SOH [VR] Wrist HUD layout: draw only HUD elements that have a home on a wrist, measure where
+    // each one lands on the TV layout, and move + size it (x' = s x + ox w, applied to the OUTPUT
+    // vertices below, so shared loaded vertices are never touched) into its slot on its hand's
+    // canvas. 2D pass: w is 1 for rects and the ortho HUD view, so x/w, y/w are NDC.
+    float vrHudOffset[3] = { 1.0f, 0.0f, 0.0f };
+    if (g_vr_hud_layout_pass) {
+        const float ndc[6] = { v1->x / v1->w, v1->y / v1->w, v2->x / v2->w,
+                               v2->y / v2->w, v3->x / v3->w, v3->y / v3->w };
+        if (!vr_hud_tri(ndc, vrHudOffset)) {
+            return;
+        }
+    }
+
     const uint32_t cull_both = get_attr(CULL_BOTH);
     const uint32_t cull_front = get_attr(CULL_FRONT);
     const uint32_t cull_back = get_attr(CULL_BACK);
@@ -2116,8 +2129,10 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             z = (z + w) / 2.0f;
         }
 
-        mBufVbo[mBufVboLen++] = v_arr[i]->x;
-        mBufVbo[mBufVboLen++] = clip_parameters.invertY ? -v_arr[i]->y : v_arr[i]->y;
+        const float vx = v_arr[i]->x * vrHudOffset[0] + vrHudOffset[1] * w; // SOH [VR] wrist slot
+        const float vy = v_arr[i]->y * vrHudOffset[0] + vrHudOffset[2] * w; // (identity otherwise)
+        mBufVbo[mBufVboLen++] = vx;
+        mBufVbo[mBufVboLen++] = clip_parameters.invertY ? -vy : vy;
         mBufVbo[mBufVboLen++] = z;
         mBufVbo[mBufVboLen++] = w;
 
@@ -2830,7 +2845,7 @@ void Interpreter::GfxDpSetFillColor(uint32_t packed_color) {
     mRdp->fill_color.a = a * 255;
 }
 
-void Interpreter::GfxDrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry) {
+void Interpreter::GfxDrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry, bool textured) {
     uint32_t saved_other_mode_h = mRdp->other_mode_h;
     uint32_t cycle_type = (mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE));
 
@@ -2876,6 +2891,23 @@ void Interpreter::GfxDrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_
     ur->y = ulyf;
     ur->z = -1.0f;
     ur->w = 1.0f;
+
+    // SOH [VR] World-space 2D state (VR_SetRectWorldPanel): in a stereo pass a textured rect's
+    // corners go through the game's panel matrix into the world, then through the eye's view x
+    // projection (P_matrix holds it after any projection load), instead of covering the eye's NDC.
+    if (textured && g_vr_rect_world && vr_is_initialized() && !vr_is_rendering_hud()) {
+        float panelClip[4][4];
+        MatrixMul(panelClip, g_vr_rect_world_mtx, mRsp->P_matrix);
+        LoadedVertex* corners[4] = { ul, ll, lr, ur };
+        for (LoadedVertex* c : corners) {
+            const float x = c->x;
+            const float y = c->y;
+            c->x = x * panelClip[0][0] + y * panelClip[1][0] + panelClip[3][0];
+            c->y = x * panelClip[0][1] + y * panelClip[1][1] + panelClip[3][1];
+            c->z = x * panelClip[0][2] + y * panelClip[1][2] + panelClip[3][2];
+            c->w = x * panelClip[0][3] + y * panelClip[1][3] + panelClip[3][3];
+        }
+    }
 
     // The coordinates for texture rectangle shall bypass the viewport setting
     struct XYWidthHeight default_viewport;
@@ -2964,7 +2996,7 @@ void Interpreter::GfxDpTextureRectangle(int32_t ulx, int32_t uly, int32_t lrx, i
     }
     mRdp->first_tile_index = tile;
 
-    GfxDrawRectangle(ulx, uly, lrx, lry);
+    GfxDrawRectangle(ulx, uly, lrx, lry, true);
     if (saved_tile != tile) {
         mRdp->textures_changed[0] = true;
         mRdp->textures_changed[1] = true;
@@ -3013,7 +3045,7 @@ void Interpreter::GfxDpImageRectangle(int32_t tile, int32_t w, int32_t h, int32_
     }
     mRdp->first_tile_index = tile;
 
-    GfxDrawRectangle(ulx, uly, lrx, lry);
+    GfxDrawRectangle(ulx, uly, lrx, lry, true);
     if (saved_tile != tile) {
         mRdp->textures_changed[0] = true;
         mRdp->textures_changed[1] = true;
@@ -3027,6 +3059,14 @@ void Interpreter::GfxDpFillRectangle(int32_t ulx, int32_t uly, int32_t lrx, int3
         bool isFullScreen = (ulx <= 0 && uly <= 0 && lrx >= (int32_t)(mNativeDimensions.width - 1) * 4 &&
                              lry >= (int32_t)(mNativeDimensions.height - 1) * 4);
         if (isFullScreen) {
+            // SOH [VR] A stereo eye pass binds its OpenXR image directly (not a backend framebuffer)
+            // and clears it when the pass begins, so the frame-start fill stays redundant there. A
+            // full-screen Z fill later in the list is a real request, though (the world-space pause
+            // menu clears depth so its 3D Link only competes with himself): honor it on the eye.
+            if (vr_is_initialized() && !vr_is_rendering_hud()) {
+                Flush();
+                vr_clear_current_eye_depth();
+            }
             return;
         }
 
@@ -4260,6 +4300,11 @@ bool gfx_vrphys_mask_handler_custom(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
 
     // w1: 0 = unmask, 1 = mask (exclude from harvest), 2 = flesh material on, 3 = flesh off.
+    // 0x1xx = VR HUD group marker (VR_HUD_MARKER, vr_interface.h), sharing the opcode.
+    if ((cmd->words.w1 & 0xFF00) == 0x100) {
+        vr_hud_marker((uint32_t)cmd->words.w1);
+        return false;
+    }
     switch (cmd->words.w1) {
         case 2:
             vrphys_mesh_set_flesh(true);
