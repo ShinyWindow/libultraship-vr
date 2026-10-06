@@ -12,6 +12,7 @@
 #include <wrl/client.h>
 
 #include <dxgi1_3.h>
+#include <dxgi1_6.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
 
@@ -101,6 +102,42 @@ void GfxRenderingAPIDX11::CreateDepthStencilObjects(uint32_t width, uint32_t hei
         ThrowIfFailed(mDevice->CreateShaderResourceView(texture.Get(), &srv_desc, srv));
     }
 }
+// SOH [VR] The adapter to create the device on (mPreferredAdapterLuid, else the high-performance
+// GPU when asked), or null for the system default. OpenXR requires the device on the adapter the
+// runtime names; the default adapter is often the integrated GPU on laptops and on desktops with
+// the iGPU enabled, while the headset hangs off the dedicated one.
+static Microsoft::WRL::ComPtr<IDXGIAdapter1> PickAdapter(GfxRenderingAPIDX11* self) {
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+    if (self->mPreferredAdapterLuid == 0 && !self->mPreferHighPerformance) {
+        return adapter;
+    }
+    HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
+    auto createFactory = dxgi ? reinterpret_cast<HRESULT(WINAPI*)(REFIID, void**)>(
+                                    GetProcAddress(dxgi, "CreateDXGIFactory1"))
+                              : nullptr;
+    Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+    if (createFactory == nullptr || FAILED(createFactory(IID_PPV_ARGS(&factory)))) {
+        return adapter;
+    }
+    if (self->mPreferredAdapterLuid != 0) {
+        const LONG high = (LONG)(uint32_t)(self->mPreferredAdapterLuid >> 32);
+        const DWORD low = (DWORD)(self->mPreferredAdapterLuid & 0xffffffffu);
+        Microsoft::WRL::ComPtr<IDXGIAdapter1> a;
+        for (UINT i = 0; factory->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
+            DXGI_ADAPTER_DESC1 d;
+            if (SUCCEEDED(a->GetDesc1(&d)) && d.AdapterLuid.HighPart == high && d.AdapterLuid.LowPart == low) {
+                return a;
+            }
+        }
+        SPDLOG_WARN("[VR] The adapter the headset runtime requires was not found; using the high-performance GPU");
+    }
+    Microsoft::WRL::ComPtr<IDXGIFactory6> factory6;
+    if (SUCCEEDED(factory.As(&factory6))) {
+        factory6->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter));
+    }
+    return adapter;
+}
+
 static bool CreateDeviceFunc(class GfxRenderingAPIDX11* self, bool SoftwareRenderer) {
 #if DEBUG_D3D
     UINT device_creation_flags = D3D11_CREATE_DEVICE_DEBUG;
@@ -120,9 +157,28 @@ static bool CreateDeviceFunc(class GfxRenderingAPIDX11* self, bool SoftwareRende
         SPDLOG_INFO("Using software renderer.");
     }
 
-    HRESULT res = self->mDX11CreateDevice(
-        NULL, SoftwareRenderer ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE, nullptr, device_creation_flags, NULL,
-        NULL, D3D11_SDK_VERSION, self->mDevice.GetAddressOf(), &self->mFeatureLevel, self->mContext.GetAddressOf());
+    // SOH [VR] On the adapter VR needs when one was picked (an explicit adapter takes
+    // D3D_DRIVER_TYPE_UNKNOWN); if that fails, the system default as before.
+    HRESULT res = E_FAIL;
+    if (!SoftwareRenderer) {
+        Microsoft::WRL::ComPtr<IDXGIAdapter1> picked = PickAdapter(self);
+        if (picked) {
+            res = self->mDX11CreateDevice(picked.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, device_creation_flags, NULL,
+                                          NULL, D3D11_SDK_VERSION, self->mDevice.ReleaseAndGetAddressOf(),
+                                          &self->mFeatureLevel, self->mContext.ReleaseAndGetAddressOf());
+            if (FAILED(res)) {
+                SPDLOG_WARN("[VR] Creating the D3D device on the picked adapter failed (0x{:08x}); using the "
+                            "default adapter",
+                            (uint32_t)res);
+            }
+        }
+    }
+    if (FAILED(res)) {
+        res = self->mDX11CreateDevice(NULL, SoftwareRenderer ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE,
+                                      nullptr, device_creation_flags, NULL, NULL, D3D11_SDK_VERSION,
+                                      self->mDevice.ReleaseAndGetAddressOf(), &self->mFeatureLevel,
+                                      self->mContext.ReleaseAndGetAddressOf());
+    }
 
     // Get and log name of adapter
     IDXGIDevice* DXGIDevice = nullptr;

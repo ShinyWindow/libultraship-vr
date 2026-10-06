@@ -12,6 +12,14 @@ class Interpreter;
 Fast::Interpreter* vr_get_interpreter();
 
 // Lifecycle
+// Whether VR can run on a renderer (Fast::WindowBackend id): one table for everything that decides
+// whether VR may start (eager init, vr_apply_mode_request, the game's renderer popups).
+bool vr_backend_supported(int window_backend);
+// Call BEFORE the renderer creates its device, only when VR will start at launch: asks the OpenXR
+// runtime which GPU the headset needs (D3D11: the adapter LUID, (HighPart << 32) | LowPart) so the
+// device is created there. False when unknown (headset not available yet, API without an adapter
+// requirement). Leaves the instance alive for vr_init to reuse.
+bool vr_probe_required_adapter(int window_backend, uint64_t* luid);
 bool vr_init();
 void vr_shutdown();
 // Latch a pending VR<->flat mode request (CVar gVrEnabled). Call ONLY at a game-tick boundary,
@@ -48,6 +56,9 @@ struct VrFrameStats {
 };
 void vr_report_frame_times(float eyes_ms, float hud_ms, float desktop_ms, float frame_ms, bool rendered_eyes);
 void vr_report_game_tick_ms(float tick_ms);
+// Commit a snap turn latched by the right stick; called at the start of each game tick so the
+// tick culls and records for the turned heading.
+void vr_commit_pending_snap_turn();
 void vr_get_frame_stats(struct VrFrameStats* out);
 
 // Per-eye
@@ -152,6 +163,11 @@ void vr_register_hand_child_matrix(const void* mtx, int hand, const float* local
 // with the hand registries.
 bool vr_get_head_matrix(float out[4][4]);
 void vr_register_head_child_matrix(const void* mtx, const float* local_mf16);
+// The playspace frame (origin = this render pass's interpolated anchor, playspace axes) and its
+// child registry: substituted with (playspace now) x (local_mf16) per eye. Cleared with the hand
+// registries.
+bool vr_get_playspace_matrix(float out[4][4]);
+void vr_register_playspace_child_matrix(const void* mtx, const float* local_mf16);
 void vr_clear_hand_matrices();
 bool vr_lookup_hand_matrix(const void* mtx, float out[4][4]);
 
@@ -185,6 +201,7 @@ bool vr_is_rendering_screen();
 // show. Rendered once per frame like the HUD, as a 2D pass (vr_is_rendering_hud() is true).
 void vr_set_text_commands(void* commands, const float crop[4]);
 void* vr_get_text_commands();
+void vr_set_text_panel_layout(float width_m, float distance_m, float height_m);
 void vr_begin_text();
 void vr_end_text();
 bool vr_is_rendering_text();
@@ -193,12 +210,13 @@ bool vr_wants_coverage_blend();
 
 // HUD elements (see VR_HUD_MARKER in vr_interface.h). g_vr_hud_layout_pass is true only during a
 // HUD pass that filters/lays out elements (wrist layout, or the world-space pause frame); the
-// interpreter then asks vr_hud_tri, per triangle, whether to draw it, and gets { s, ox, oy }:
-// clip-space x' = s x + ox w, y' = s y + oy w moves and sizes it into its slot (identity on the
-// pause frame). A plain global so the per-triangle check costs a load when it's off.
+// interpreter then asks vr_hud_tri, per triangle, whether to draw it, and gets { s, ox, oy, sy }:
+// clip-space x' = s x + ox w, y' = sy y + oy w moves and sizes it into its slot (wrists: sy = s;
+// pause frame: pinned to its corner of the resizable canvas). A plain global so the per-triangle
+// check costs a load when it's off.
 extern bool g_vr_hud_layout_pass;
 void vr_hud_marker(uint32_t w1);
-bool vr_hud_tri(const float ndc_xy[6], float out_scale_offset[3]);
+bool vr_hud_tri(const float ndc_xy[6], float out_scale_offset[4]);
 // Link's age, for the Adult / Child wrist HUD settings profile (vr_hud_settings.h).
 void vr_set_hud_child(bool child);
 bool vr_get_hud_child();
@@ -224,6 +242,9 @@ void vr_get_2d_target_size(uint32_t* w, uint32_t* h);
 // mirror isn't available.
 void vr_capture_mirror();
 void* vr_get_mirror_texture_id();
+// True when the mirror copies are stored bottom-up (OpenGL): draw the eye mirror with V flipped.
+// vr_get_mirror_quads already flips its own UVs.
+bool vr_get_mirror_flip_v();
 
 // The headset's quad layers (HUD / wrist panels, text panel, flat-screen panel, pause HUD frame)
 // as the mirrored left eye sees them, for the companion window to draw over the mirror: each quad

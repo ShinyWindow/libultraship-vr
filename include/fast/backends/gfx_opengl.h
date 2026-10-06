@@ -105,6 +105,11 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
 
+    // SOH [VR] Make an OpenXR swapchain image's FBO (built by vr_gfx_opengl.cpp) the current
+    // target: it gets a framebuffer slot of its own, so GetClipParameters (invertY = false, like
+    // window fb 0), the decal depth bias and every mid-pass rebind see the right target.
+    void SetExternalFramebuffer(GLuint fbo, uint32_t width, uint32_t height);
+
   private:
     void SetUniforms(ShaderProgram* prg) const;
     std::string BuildFsShader(const CCFeatures& cc_features);
@@ -135,6 +140,8 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     FilteringMode mCurrentFilterMode = FILTER_THREE_POINT;
 
     GLint mMaxMsaaLevel = 1;
+    int mExternalFbSlot = -1;     // SOH [VR] mFrameBuffers slot for the XR target (SetExternalFramebuffer)
+    int8_t mLastCoverageBlend = -1; // SOH [VR] which blend func is set: 0 = normal, 1 = VR quad coverage
     GLuint mPixelDepthRb = 0;
     GLuint mPixelDepthFb = 0;
     size_t mPixelDepthRbSize = 0;

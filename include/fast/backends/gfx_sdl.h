@@ -42,6 +42,7 @@ class GfxWindowBackendSDL2 final : public GfxWindowBackend {
     bool IsFullscreen() override;
 
   private:
+    bool mXrPacedApplied = false; // SOH [VR] swap interval currently forced to 0 for xrWaitFrame pacing
     void SetFullscreenImpl(bool on, bool call_callback);
     void HandleSingleEvent(SDL_Event& event);
     int TranslateScancode(int scancode) const;

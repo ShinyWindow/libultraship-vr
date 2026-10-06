@@ -8,24 +8,24 @@ bool g_vr_hud_layout_pass = false;
 bool g_vr_rect_world = false;
 float g_vr_rect_world_mtx[4][4] = {};
 
-#ifdef ENABLE_DX11
+#include <cstring>
 
-#include <d3d11_1.h>
+// SOH [VR] The OpenXR core is API-neutral: every graphics-API call goes through the VrGfx leaf
+// for the running renderer (vr_gfx.h; vr_gfx_d3d11.cpp, ...). ENABLE_VR = OpenXR is linked.
+#ifdef ENABLE_VR
+
 #include <algorithm>
 #include <vector>
 #include <string>
-#include <cstring>
 #include <cmath>
 #include <chrono>
+#include <memory>
 #include <unordered_map>
 
-#include <d3d11.h>
-#include <wrl/client.h>
-using Microsoft::WRL::ComPtr;
-
-#define XR_USE_GRAPHICS_API_D3D11
+#ifdef _WIN32
+#include <windows.h> // OpenXR environment diagnostics (registry, env); no graphics API here
+#endif
 #include <openxr/openxr.h>
-#include <openxr/openxr_platform.h>
 
 #include <spdlog/spdlog.h>
 
@@ -33,8 +33,8 @@ using Microsoft::WRL::ComPtr;
 #include "ship/Context.h"
 #include "fast/Fast3dWindow.h"
 #include "fast/interpreter.h"
-#include "fast/backends/gfx_direct3d_common.h"
 #include "fast/vr_physics.h"
+#include "vr_gfx.h"
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -42,9 +42,7 @@ using Microsoft::WRL::ComPtr;
 #include <glm/gtc/quaternion.hpp>
 
 // --------------------------------------------------------------------------
-// Engine glue (post-GfxPC-refactor): the renderer is Fast::Interpreter owned by Fast3dWindow, and
-// the D3D11 device/context live as public members on GfxRenderingAPIDX11. These shims keep the
-// pre-refactor accessor names used throughout this file.
+// Engine glue: the renderer is Fast::Interpreter owned by Fast3dWindow.
 // --------------------------------------------------------------------------
 
 Fast::Interpreter* vr_get_interpreter() {
@@ -60,28 +58,10 @@ Fast::Interpreter* vr_get_interpreter() {
     return interp ? interp.get() : nullptr;
 }
 
-static Fast::GfxRenderingAPIDX11* vr_dx11() {
-    Fast::Interpreter* interp = vr_get_interpreter();
-    if (!interp) {
-        return nullptr;
-    }
-    return static_cast<Fast::GfxRenderingAPIDX11*>(interp->GetCurrentRenderingAPI());
-}
-
-static void* gfx_d3d11_get_device() {
-    auto* dx = vr_dx11();
-    return dx ? dx->mDevice.Get() : nullptr;
-}
-
-static void* gfx_d3d11_get_context() {
-    auto* dx = vr_dx11();
-    return dx ? dx->mContext.Get() : nullptr;
-}
-
-static void gfx_d3d11_set_render_target_height(uint32_t height) {
-    if (auto* dx = vr_dx11()) {
-        dx->SetRenderTargetHeight((int32_t)height);
-    }
+static int vr_running_window_backend() {
+    Ship::Context* ctx = Ship::Context::GetRawInstance();
+    auto wnd = ctx ? std::dynamic_pointer_cast<Fast::Fast3dWindow>(ctx->GetWindow()) : nullptr;
+    return wnd ? wnd->GetWindowBackend() : 0;
 }
 
 // The interpreter sizes 2D/flat renders from mCurDimensions; point them at the given target so
@@ -140,15 +120,15 @@ static struct {
     XrView views[2];
     XrViewConfigurationView config_views[2];
 
+    // Graphics leaf for the running renderer: owns every API object (images, targets, depth,
+    // mirror copies). The core keeps only the OpenXR handles and sizes.
+    std::unique_ptr<vrgfx::Backend> gfx;
+
     // Swapchains (one per eye)
     struct EyeSwapchain {
         XrSwapchain handle;
         int64_t format;
         uint32_t width, height;
-        std::vector<XrSwapchainImageD3D11KHR> images;
-        std::vector<ComPtr<ID3D11RenderTargetView>> rtvs;
-        std::vector<ComPtr<ID3D11DepthStencilView>> dsvs;
-        std::vector<ComPtr<ID3D11Texture2D>> depth_textures;
     } eye_swapchains[2];
 
     // Per-frame
@@ -249,6 +229,7 @@ static struct {
     uint32_t text_image_index;
     void* text_commands;
     float text_crop[4];       // u0, v0, u1, v1 of the 320x240 frame: the region the panel shows
+    float text_layout[3];     // per-frame override (width m, distance m, height m); <= 0 = the setting
     bool rendering_text;
     bool text_has_image;      // rendered at least once since the text box opened
     bool text_was_visible;    // last frame's submit decision: a hidden -> shown edge snaps the panel
@@ -299,7 +280,14 @@ static struct {
     float hud_world_yaw;
     float hud_world_size[2];
     bool hud_world_pass; // this HUD pass draws for the world panel (no backings, no wrist latch)
-    ComPtr<ID3D11DeviceContext1> d3d_context1; // ClearView for the dark backings
+    // Pause-frame canvas (vr_hud_world_canvas: width x, height x, element size x), latched per pass,
+    // and each element's corner on it (x -1 left / +1 right, y +1 top / -1 bottom), chosen from
+    // where it sat on the TV frame in the previous pass.
+    float hud_world_canvas[3];
+    float hud_world_meas[VR_HUD_EL_COUNT][4];
+    bool hud_world_meas_any[VR_HUD_EL_COUNT];
+    float hud_world_anchor[VR_HUD_EL_COUNT][2];
+    bool hud_world_anchor_valid[VR_HUD_EL_COUNT];
 
     // Centre-eye pose this frame, RAW tracking space (no artificial turn): what the head really did.
     glm::vec3 head_pos_raw;
@@ -319,34 +307,19 @@ static struct {
     bool hud_ever_rendered;    // likewise for the HUD quad — its swapchain starts uninitialised
     bool screen_ever_rendered; // and for the flat-screen panel
 
-    // Desktop mirror: a copy of the left eye for display in the companion window. We can't sample the
-    // swapchain image directly at present time (the runtime owns it once released), so the left eye is
-    // copied here each frame while still acquired.
-    ComPtr<ID3D11Texture2D> mirror_texture;
-    ComPtr<ID3D11ShaderResourceView> mirror_srv;
-
-    // Desktop mirror of the headset's QUAD layers (HUD / wrist panels, text panel, flat-screen
-    // panel). They are composited by the runtime, so the eye mirror never contains them; the
+    // Desktop mirror: copies of the left eye and of the headset's QUAD layers (HUD / wrist panels,
+    // text panel, flat-screen panel), owned by the graphics leaf (vrgfx mirror slots). A swapchain
+    // image can't be read after release, so each pass copies its image while still acquired. The
+    // quad layers are composited by the runtime, so the eye mirror never contains them; the
     // companion window redraws each one through the left eye instead (vr_get_mirror_quads).
-    // A swapchain image can't be read after release, so each 2D pass copies its image here while
-    // still acquired. [0] HUD, [1] text, [2] flat-screen panel.
-    struct LayerCopy {
-        ComPtr<ID3D11Texture2D> tex;
-        ComPtr<ID3D11ShaderResourceView> srv;
-        uint32_t w, h;
-    } layer_copy[3];
     // The quads submitted this frame (pose in RAW local space, as the compositor got them).
     struct MirrorQuad {
-        int src;
+        int src; // 0 HUD, 1 text, 2 flat-screen panel
         XrPosef pose;
         XrExtent2Df size;
         XrRect2Di rect;
     } mirror_quads[8];
     int mirror_quad_count;
-    DXGI_FORMAT view_format; // the swapchains' shader-view format (their images may be typeless)
-    // D3D11 cached pointers
-    ID3D11Device* d3d_device;
-    ID3D11DeviceContext* d3d_context;
 
     bool initialized;
     // Runtime VR<->flat toggle. `initialized` means the OpenXR session exists; `enabled` means the
@@ -366,6 +339,17 @@ static struct {
     bool color_scale_supported;
     float view_fade_target;
     float view_fade_current;
+
+    // Connection lifecycle (vr_apply_mode_request). A session the runtime lost or ended is only
+    // flagged where it is noticed and torn down at the next tick boundary, where no display list or
+    // XR frame is in flight; a lost one then reconnects, an ended one turns VR off. A vr_init failure
+    // worth retrying (headset not detected yet) is retried for a while instead of turning VR off.
+    bool session_lost;       // LOSS_PENDING, instance loss, or a call returned *_LOST
+    bool session_exited;     // EXITING: the runtime ended the session (e.g. the user quit it)
+    bool init_retryable;     // the last vr_init failure may succeed later; the instance is kept
+    // Some runtimes / streaming bridges report "not worn" for a headset that is (proximity sensor
+    // disabled or not forwarded). "Not worn" only drops VR once "worn" has been seen this session.
+    bool presence_confirmed;
 } xr = {};
 
 static void vr_restore_eye_dimensions() {
@@ -381,6 +365,9 @@ static void vr_restore_eye_dimensions() {
 
 static bool xr_check(XrResult result, const char* msg) {
     if (XR_SUCCEEDED(result)) return true;
+    if (result == XR_ERROR_SESSION_LOST || result == XR_ERROR_INSTANCE_LOST) {
+        xr.session_lost = true;
+    }
     if (xr.instance != XR_NULL_HANDLE) {
         char buf[XR_MAX_RESULT_STRING_SIZE];
         xrResultToString(xr.instance, result, buf);
@@ -440,11 +427,30 @@ static void pose_to_view_matrix(const XrPosef& pose, float world_scale, float ou
 // OpenXR session state event handling
 // --------------------------------------------------------------------------
 
+static const char* vr_session_state_name(XrSessionState s) {
+    switch (s) {
+        case XR_SESSION_STATE_IDLE: return "IDLE";
+        case XR_SESSION_STATE_READY: return "READY";
+        case XR_SESSION_STATE_SYNCHRONIZED: return "SYNCHRONIZED";
+        case XR_SESSION_STATE_VISIBLE: return "VISIBLE";
+        case XR_SESSION_STATE_FOCUSED: return "FOCUSED";
+        case XR_SESSION_STATE_STOPPING: return "STOPPING";
+        case XR_SESSION_STATE_LOSS_PENDING: return "LOSS_PENDING";
+        case XR_SESSION_STATE_EXITING: return "EXITING";
+        default: return "UNKNOWN";
+    }
+}
+
 static void handle_session_state_change(XrSessionState new_state) {
+    // Logged in full: a session stuck short of VISIBLE (or bouncing out of it) is the first thing to
+    // read in a "the game runs but the headset shows nothing" report.
+    spdlog::info("[VR] Session state: {} -> {}", vr_session_state_name(xr.session_state),
+                 vr_session_state_name(new_state));
     xr.session_state = new_state;
 
     switch (new_state) {
         case XR_SESSION_STATE_READY: {
+            xr.presence_confirmed = false;
             XrSessionBeginInfo begin_info = { XR_TYPE_SESSION_BEGIN_INFO };
             begin_info.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
             if (xr_check(xrBeginSession(xr.session, &begin_info), "xrBeginSession")) {
@@ -462,8 +468,12 @@ static void handle_session_state_change(XrSessionState new_state) {
         case XR_SESSION_STATE_LOSS_PENDING:
         case XR_SESSION_STATE_EXITING:
             xr.session_running = false;
-            xr.initialized = false;
-            spdlog::warn("[VR] Session lost or exiting");
+            if (new_state == XR_SESSION_STATE_LOSS_PENDING) {
+                xr.session_lost = true;
+            } else {
+                xr.session_exited = true;
+            }
+            // Torn down at the next tick boundary (vr_apply_mode_request); frames stop meanwhile.
             break;
         default:
             break;
@@ -585,7 +595,18 @@ static void poll_events() {
             // right after the session starts.
             auto* presence_event = reinterpret_cast<XrEventDataUserPresenceChangedEXT*>(&event);
             xr.user_present = (presence_event->isUserPresent == XR_TRUE);
-            spdlog::info("[VR] Headset {}", xr.user_present ? "donned" : "doffed");
+            if (xr.user_present) {
+                xr.presence_confirmed = true;
+                spdlog::info("[VR] Headset donned");
+            } else if (xr.presence_confirmed) {
+                spdlog::info("[VR] Headset doffed");
+            } else {
+                spdlog::info("[VR] Runtime reports the headset not worn before ever reporting it worn; "
+                             "staying in VR (proximity sensor may be disabled or not forwarded)");
+            }
+        } else if (event.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
+            spdlog::warn("[VR] OpenXR instance loss pending (runtime shutting down or restarting)");
+            xr.session_lost = true;
         } else if (event.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
             // The user triggered the runtime's built-in recenter: LOCAL space reorients so their
             // CURRENT physical facing becomes the new neutral. Because our view frames compose
@@ -850,10 +871,30 @@ static void update_input() {
 static glm::quat g_turn_rot(1.0f, 0.0f, 0.0f, 0.0f);
 static glm::vec3 g_turn_off(0.0f);
 
+// A SNAP waits for the next game tick (vr_commit_pending_snap_turn, from VR_GameTickBegin). The
+// tick records its display lists once, culled against the head pose it read, and they are then
+// shown for every sub-frame until the next tick; a snap applied mid-tick showed those lists turned
+// 45 degrees, with the edge on the turned-toward side culled away for up to 50 ms. Committing at
+// the tick boundary lets that tick cull for the new heading. Smooth turning steps a degree or two
+// per frame, well inside the culling padding, so it still applies per frame.
+static float g_snap_pending_deg = 0.0f;
+static int g_snap_pending_frames = 0;
+
 // Drop the accumulated artificial turn (system recenter: it was expressed in old-space coords).
 static void vr_reset_snap_turn() {
     g_turn_rot = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
     g_turn_off = glm::vec3(0.0f);
+    g_snap_pending_deg = 0.0f;
+    g_snap_pending_frames = 0;
+}
+
+// The world-space pause frame's canvas relative to the TV frame it replaces: { width x, height x,
+// element size x } (gVrPauseHudWidth / Height / Scale, percent). 1, 1, 1 = vanilla's framing; the
+// width defaults to 1.3 (user, October 5) so the left and right groups spread off the pages.
+static void vr_hud_world_canvas(float out[3]) {
+    out[0] = std::clamp(CVarGetFloat("gVrPauseHudWidth", 130.0f), 50.0f, 400.0f) / 100.0f;
+    out[1] = std::clamp(CVarGetFloat("gVrPauseHudHeight", 100.0f), 50.0f, 400.0f) / 100.0f;
+    out[2] = std::clamp(CVarGetFloat("gVrPauseHudScale", 100.0f), 25.0f, 300.0f) / 100.0f;
 }
 
 static XrPosef apply_turn(const XrPosef& p) {
@@ -882,6 +923,48 @@ static void vr_apply_snap_turn(float degrees_right) {
     const glm::vec3 pivot = g_turn_rot * raw_center + g_turn_off; // where the head currently appears
     g_turn_rot = glm::normalize(r * g_turn_rot);
     g_turn_off = r * (g_turn_off - pivot) + pivot;
+}
+
+// Commit a latched snap at the game-tick boundary. By now vr_begin_frame has already turned this
+// frame's poses, so the pivot is the TURNED centre eye, and every game-facing pose the tick is
+// about to read (views, grips, aims, the view matrices) gets the same rotation about it — the tick
+// then sees one consistent, already-turned frame. Re-checks the turn gates: a context that took
+// the turn away since the stick latched (pause, flat screen, third person) drops the snap.
+void vr_commit_pending_snap_turn() {
+    if (g_snap_pending_deg == 0.0f) {
+        return;
+    }
+    const float deg = g_snap_pending_deg;
+    g_snap_pending_deg = 0.0f;
+    g_snap_pending_frames = 0;
+    if (!xr.initialized || xr.flat_screen || !xr.first_person || g_turn_suppressed) {
+        return;
+    }
+    const float rad = deg * (3.14159265358979323846f / 180.0f);
+    const glm::quat r = glm::angleAxis(-rad, glm::vec3(0.0f, 1.0f, 0.0f));
+    const glm::vec3 pivot =
+        0.5f * (glm::vec3(xr.views[0].pose.position.x, xr.views[0].pose.position.y, xr.views[0].pose.position.z) +
+                glm::vec3(xr.views[1].pose.position.x, xr.views[1].pose.position.y, xr.views[1].pose.position.z));
+    g_turn_rot = glm::normalize(r * g_turn_rot);
+    g_turn_off = r * (g_turn_off - pivot) + pivot;
+
+    auto rotate_about_pivot = [&r, &pivot](XrPosef& p) {
+        const glm::vec3 pos = r * (glm::vec3(p.position.x, p.position.y, p.position.z) - pivot) + pivot;
+        const glm::quat q = glm::normalize(r * glm::quat(p.orientation.w, p.orientation.x, p.orientation.y,
+                                                         p.orientation.z));
+        p.position = { pos.x, pos.y, pos.z };
+        p.orientation = { q.x, q.y, q.z, q.w };
+    };
+    for (int eye = 0; eye < 2; eye++) {
+        rotate_about_pivot(xr.views[eye].pose);
+        pose_to_view_matrix(xr.views[eye].pose, xr.world_scale, xr.view[eye]);
+    }
+    for (int h = 0; h < 2; h++) {
+        if (xr.hand_active[h]) {
+            rotate_about_pivot(xr.grip_pose[h]);
+            rotate_about_pivot(xr.aim_pose[h]);
+        }
+    }
 }
 
 // Lock-on framing request from the game: the world direction of the current lock-on target, and
@@ -959,7 +1042,7 @@ void vr_set_lockon_yaw(int16_t yaw_binang, bool active) {
 // The heading the player WILL have this frame: the raw HMD forward carried through the turn
 // accumulated so far. vr_get_heading_yaw reads xr.views, which are still raw at the point the turn
 // block runs (apply_turn happens further down), so the turn has to be composed in by hand here.
-// Matches vr_get_heading_yaw's convention exactly, manual offset included, so "the target is dead
+// Matches vr_get_heading_yaw's convention exactly, so "the target is dead
 // ahead" means the same thing to the framing code and to Link's steering.
 static bool vr_pending_heading_yaw(int16_t* out) {
     const XrQuaternionf& q = xr.views[0].pose.orientation;
@@ -969,28 +1052,163 @@ static bool vr_pending_heading_yaw(int16_t* out) {
         return false; // looking straight up or down: heading is degenerate, correct nothing
     }
     const float yaw = atan2f(fwd.x, fwd.z);
-    const int16_t manual = static_cast<int16_t>(CVarGetInteger("gVrHeadingManualOffset", 0));
-    *out = static_cast<int16_t>(static_cast<int16_t>(yaw * (32768.0f / 3.14159265358979323846f)) + manual);
+    *out = static_cast<int16_t>(yaw * (32768.0f / 3.14159265358979323846f));
     return true;
+}
+
+// --------------------------------------------------------------------------
+// OpenXR environment diagnostics
+// --------------------------------------------------------------------------
+// Most "VR won't start" / "the headset stays black" reports come down to the machine's OpenXR
+// setup, which other VR games often never touch (OpenVR titles bypass it entirely): which runtime
+// the loader is pointed at, and which API layers it injects into every OpenXR app. All of it goes
+// to the log, so one log file from a player identifies their setup.
+
+static std::string vr_narrow(const wchar_t* w) {
+    if (w == nullptr || *w == L'\0') {
+        return std::string();
+    }
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 1) {
+        return std::string();
+    }
+    std::string s(n - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, s.data(), n, nullptr, nullptr);
+    return s;
+}
+
+// The runtime manifest the loader will use: XR_RUNTIME_JSON overrides the registry.
+static std::string vr_active_runtime_path() {
+    char env[1024];
+    const DWORD env_len = GetEnvironmentVariableA("XR_RUNTIME_JSON", env, sizeof(env));
+    if (env_len > 0 && env_len < sizeof(env)) {
+        return std::string(env) + " (XR_RUNTIME_JSON override)";
+    }
+    wchar_t buf[1024];
+    DWORD size = sizeof(buf);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Khronos\\OpenXR\\1", L"ActiveRuntime", RRF_RT_REG_SZ, nullptr,
+                     buf, &size) == ERROR_SUCCESS) {
+        return vr_narrow(buf);
+    }
+    return "none registered";
+}
+
+// Implicit layers are registered as values named by their manifest path; DWORD 0 = enabled.
+static int vr_log_implicit_layers(HKEY root, const char* root_name) {
+    HKEY key;
+    if (RegOpenKeyExW(root, L"SOFTWARE\\Khronos\\OpenXR\\1\\ApiLayers\\Implicit", 0, KEY_READ, &key) != ERROR_SUCCESS) {
+        return 0;
+    }
+    int count = 0;
+    for (DWORD i = 0;; i++) {
+        wchar_t name[1024];
+        DWORD name_len = 1024;
+        DWORD type = 0;
+        DWORD data = 1;
+        DWORD data_size = sizeof(data);
+        const LONG r = RegEnumValueW(key, i, name, &name_len, nullptr, &type, reinterpret_cast<BYTE*>(&data),
+                                     &data_size);
+        if (r == ERROR_NO_MORE_ITEMS) {
+            break;
+        }
+        if (r != ERROR_SUCCESS) {
+            continue;
+        }
+        spdlog::info("[VR]   implicit layer ({}): {} [{}]", root_name, vr_narrow(name),
+                     (type == REG_DWORD && data == 0) ? "enabled" : "disabled");
+        count++;
+    }
+    RegCloseKey(key);
+    return count;
+}
+
+// Before xrCreateInstance: where the loader will go, and what it will load on the way. Once per
+// active runtime, not on every reconnect attempt.
+static void vr_log_openxr_environment() {
+    static std::string s_logged_runtime;
+    const std::string runtime = vr_active_runtime_path();
+    if (runtime == s_logged_runtime) {
+        return;
+    }
+    s_logged_runtime = runtime;
+    spdlog::info("[VR] OpenXR active runtime: {}", runtime);
+    spdlog::info("[VR] OpenXR implicit API layers (loaded into every OpenXR app while enabled):");
+    const int implicit = vr_log_implicit_layers(HKEY_LOCAL_MACHINE, "machine") +
+                         vr_log_implicit_layers(HKEY_CURRENT_USER, "user");
+    if (implicit == 0) {
+        spdlog::info("[VR]   (none)");
+    }
+    uint32_t n = 0;
+    if (XR_SUCCEEDED(xrEnumerateApiLayerProperties(0, &n, nullptr)) && n > 0) {
+        std::vector<XrApiLayerProperties> layers(n, { XR_TYPE_API_LAYER_PROPERTIES });
+        if (XR_SUCCEEDED(xrEnumerateApiLayerProperties(n, &n, layers.data()))) {
+            for (uint32_t i = 0; i < n; i++) {
+                spdlog::info("[VR]   available API layer: {} v{} - {}", layers[i].layerName, layers[i].layerVersion,
+                             layers[i].description);
+            }
+        }
+    }
+}
+
+static void vr_log_instance_properties() {
+    XrInstanceProperties p = { XR_TYPE_INSTANCE_PROPERTIES };
+    if (XR_SUCCEEDED(xrGetInstanceProperties(xr.instance, &p))) {
+        spdlog::info("[VR] OpenXR runtime: {} {}.{}.{}", p.runtimeName, XR_VERSION_MAJOR(p.runtimeVersion),
+                     XR_VERSION_MINOR(p.runtimeVersion), XR_VERSION_PATCH(p.runtimeVersion));
+    }
+}
+
+static void vr_log_system_properties() {
+    XrSystemProperties p = { XR_TYPE_SYSTEM_PROPERTIES };
+    if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.system_id, &p))) {
+        spdlog::info("[VR] Headset: {} (vendor 0x{:04x}), max {} layers, max swapchain {}x{}, "
+                     "orientation tracking {}, position tracking {}",
+                     p.systemName, p.vendorId, p.graphicsProperties.maxLayerCount,
+                     p.graphicsProperties.maxSwapchainImageWidth, p.graphicsProperties.maxSwapchainImageHeight,
+                     p.trackingProperties.orientationTracking ? "yes" : "no",
+                     p.trackingProperties.positionTracking ? "yes" : "no");
+    }
 }
 
 // --------------------------------------------------------------------------
 // Lifecycle
 // --------------------------------------------------------------------------
 
-bool vr_init() {
-    // Get D3D11 device
-    xr.d3d_device = static_cast<ID3D11Device*>(gfx_d3d11_get_device());
-    xr.d3d_context = static_cast<ID3D11DeviceContext*>(gfx_d3d11_get_context());
-    xr.d3d_context1.Reset();
-    if (xr.d3d_context) {
-        xr.d3d_context->QueryInterface(__uuidof(ID3D11DeviceContext1),
-                                       reinterpret_cast<void**>(xr.d3d_context1.GetAddressOf()));
+bool vr_backend_supported(int window_backend) {
+    // One table (plan 3.5): the renderers with a VR graphics leaf (vr_gfx_*.cpp).
+    switch (window_backend) {
+#ifdef ENABLE_DX11
+        case Fast::WindowBackend::FAST3D_DXGI_DX11:
+            return true;
+#endif
+#ifdef ENABLE_OPENGL
+        case Fast::WindowBackend::FAST3D_SDL_OPENGL:
+            return true;
+#endif
+        default:
+            return false; // Metal: no OpenXR runtime on macOS.
     }
-    if (!xr.d3d_device || !xr.d3d_context) {
-        spdlog::error("[VR] D3D11 device not available");
+}
+
+static bool vr_instance_init();
+static bool vr_session_init();
+
+bool vr_init() {
+    // The graphics leaf for the running renderer. Only a supported backend is ever handed to a
+    // leaf, so no leaf casts a renderer it wasn't built for.
+    xr.gfx.reset();
+    const int backend = vr_running_window_backend();
+    if (!vr_backend_supported(backend)) {
+        spdlog::error("[VR] VR is not available on the running renderer (backend id {})", backend);
         return false;
     }
+    Fast::Interpreter* interp = vr_get_interpreter();
+    xr.gfx = vrgfx::Create(backend, interp ? interp->GetCurrentRenderingAPI() : nullptr);
+    if (!xr.gfx) {
+        spdlog::error("[VR] No VR graphics backend for the running renderer");
+        return false;
+    }
+    spdlog::info("[VR] Graphics backend: {}", xr.gfx->ApiName());
 
     // Default configuration
     xr.world_scale = 35.0f;
@@ -1018,13 +1236,31 @@ bool vr_init() {
     // Sane default until the first frame is located and we can read the true display period.
     xr.refresh_rate = 90;
 
-    // --- Create Instance ---
-    // Optional extensions are enabled only when the runtime offers them.
+    if (!vr_instance_init()) {
+        xr.gfx->Shutdown();
+        xr.gfx.reset();
+        return false;
+    }
+    if (!vr_session_init()) {
+        if (xr.gfx) {
+            xr.gfx->Shutdown();
+            xr.gfx.reset();
+        }
+        return false;
+    }
+    return true;
+}
+
+// Create xr.instance with the renderer API's extension (+ the backend's extras) and the optional
+// extensions the runtime offers. Shared by vr_instance_init and the pre-device adapter probe.
+static bool vr_create_instance(const char* required_ext, const char* api_name, const std::vector<const char*>& extra) {
+    // Optional extensions are enabled only when the runtime offers them; the backend's graphics
+    // extension is required, and checked rather than assumed.
+    vr_log_openxr_environment();
     xr.user_presence_supported = false;
-    xr.user_present = true; // assume worn until the runtime says otherwise
     xr.color_scale_supported = false;
-    xr.view_fade_target = xr.view_fade_current = 0.0f;
     {
+        bool required_offered = false;
         uint32_t ext_count = 0;
         xrEnumerateInstanceExtensionProperties(nullptr, 0, &ext_count, nullptr);
         std::vector<XrExtensionProperties> ext_props(ext_count, { XR_TYPE_EXTENSION_PROPERTIES });
@@ -1036,16 +1272,24 @@ bool vr_init() {
             if (strcmp(p.extensionName, XR_KHR_COMPOSITION_LAYER_COLOR_SCALE_BIAS_EXTENSION_NAME) == 0) {
                 xr.color_scale_supported = true;
             }
+            if (strcmp(p.extensionName, required_ext) == 0) {
+                required_offered = true;
+            }
+        }
+        // ext_count 0 = no runtime / loader failure: let xrCreateInstance report it as before.
+        if (ext_count > 0 && !required_offered) {
+            spdlog::error("[VR] The OpenXR runtime does not offer {}: it can't run VR on {}", required_ext, api_name);
+            return false;
         }
     }
 
-    const char* extensions[3] = { XR_KHR_D3D11_ENABLE_EXTENSION_NAME };
-    uint32_t extension_count = 1;
+    std::vector<const char*> extensions = { required_ext };
+    extensions.insert(extensions.end(), extra.begin(), extra.end());
     if (xr.user_presence_supported) {
-        extensions[extension_count++] = XR_EXT_USER_PRESENCE_EXTENSION_NAME;
+        extensions.push_back(XR_EXT_USER_PRESENCE_EXTENSION_NAME);
     }
     if (xr.color_scale_supported) {
-        extensions[extension_count++] = XR_KHR_COMPOSITION_LAYER_COLOR_SCALE_BIAS_EXTENSION_NAME;
+        extensions.push_back(XR_KHR_COMPOSITION_LAYER_COLOR_SCALE_BIAS_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo instance_ci = { XR_TYPE_INSTANCE_CREATE_INFO };
@@ -1054,39 +1298,137 @@ bool vr_init() {
     strcpy(instance_ci.applicationInfo.engineName, "libultraship");
     instance_ci.applicationInfo.engineVersion = 1;
     instance_ci.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
-    instance_ci.enabledExtensionCount = extension_count;
-    instance_ci.enabledExtensionNames = extensions;
+    instance_ci.enabledExtensionCount = (uint32_t)extensions.size();
+    instance_ci.enabledExtensionNames = extensions.data();
 
     if (!xr_check(xrCreateInstance(&instance_ci, &xr.instance), "xrCreateInstance")) {
-        spdlog::error("[VR] Failed to create OpenXR instance. Make sure SteamVR is running.");
+        xr.instance = XR_NULL_HANDLE;
+        spdlog::error("[VR] Failed to create an OpenXR instance with the active runtime ({}). Start your headset's "
+                      "software (SteamVR, Meta Quest Link, Virtual Desktop, ...) and make sure it is set as the "
+                      "OpenXR runtime.",
+                      vr_active_runtime_path());
         return false;
     }
+    vr_log_instance_properties();
+    return true;
+}
 
-    // --- Get System ---
+// xrGetSystem on xr.instance. FORM_FACTOR_UNAVAILABLE = the runtime is up but the headset isn't
+// (still starting, Link not connected, asleep): the spec expects apps to retry, so the instance is
+// kept and xr.init_retryable set. Any other failure destroys the instance.
+static bool vr_get_system() {
     XrSystemGetInfo system_info = { XR_TYPE_SYSTEM_GET_INFO };
     system_info.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
-    if (!xr_check(xrGetSystem(xr.instance, &system_info, &xr.system_id), "xrGetSystem")) {
+    const XrResult system_result = xrGetSystem(xr.instance, &system_info, &xr.system_id);
+    if (system_result == XR_ERROR_FORM_FACTOR_UNAVAILABLE) {
+        xr.init_retryable = true;
+        return false;
+    }
+    if (!xr_check(system_result, "xrGetSystem")) {
         xrDestroyInstance(xr.instance);
         xr.instance = XR_NULL_HANDLE;
         return false;
     }
+    return true;
+}
 
-    // --- Check D3D11 graphics requirements ---
-    PFN_xrGetD3D11GraphicsRequirementsKHR xrGetD3D11GraphicsRequirementsKHR = nullptr;
-    xrGetInstanceProcAddr(xr.instance, "xrGetD3D11GraphicsRequirementsKHR",
-                          reinterpret_cast<PFN_xrVoidFunction*>(&xrGetD3D11GraphicsRequirementsKHR));
+// Before the renderer creates its device: the GPU the runtime requires (vr_openxr.h). The instance
+// stays alive for vr_init, which reuses it (the probe enables exactly what vr_instance_init would:
+// the leaf's extension, no backend extras (the D3D11 leaf adds none), and the same optional ones).
+bool vr_probe_required_adapter(int window_backend, uint64_t* luid) {
+    const char* ext = vrgfx::InstanceExtensionFor(window_backend);
+    if (!vr_backend_supported(window_backend) || ext == nullptr) {
+        return false;
+    }
+    if (xr.instance == XR_NULL_HANDLE && !vr_create_instance(ext, vrgfx::ApiNameFor(window_backend), {})) {
+        return false;
+    }
+    xr.init_retryable = false;
+    if (!vr_get_system()) {
+        spdlog::info("[VR] Headset not available at startup: the renderer picks the high-performance GPU");
+        return false;
+    }
+    if (!vrgfx::RequiredAdapterLuid(window_backend, xr.instance, xr.system_id, luid)) {
+        return false;
+    }
+    spdlog::info("[VR] Headset runtime requires adapter LUID {:08x}:{:08x}; the renderer will create its device there",
+                 (uint32_t)(*luid >> 32), (uint32_t)(*luid & 0xffffffffu));
+    return true;
+}
 
-    XrGraphicsRequirementsD3D11KHR gfx_requirements = { XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR };
-    if (xrGetD3D11GraphicsRequirementsKHR) {
-        xrGetD3D11GraphicsRequirementsKHR(xr.instance, xr.system_id, &gfx_requirements);
+// Instance + system + graphics requirements (plan 3.5). Kept apart from the session so a
+// renderer that must create its device THROUGH OpenXR (Vulkan) can run this before its own Init.
+static bool vr_instance_init() {
+    xr.user_present = true; // assume worn until the runtime says otherwise
+    xr.view_fade_target = xr.view_fade_current = 0.0f;
+    xr.init_retryable = false;
+    xr.session_lost = false;
+    xr.session_exited = false;
+
+    // An instance kept from an attempt whose headset wasn't available yet, or from the pre-device
+    // adapter probe, is reused: re-creating it every retry would re-launch some runtimes.
+    if (xr.instance == XR_NULL_HANDLE) {
+        std::vector<const char*> extra;
+        xr.gfx->AddInstanceExtensions(extra);
+        if (!vr_create_instance(xr.gfx->RequiredInstanceExtension(), xr.gfx->ApiName(), extra)) {
+            return false;
+        }
     }
 
-    // --- Create Session ---
-    XrGraphicsBindingD3D11KHR d3d_binding = { XR_TYPE_GRAPHICS_BINDING_D3D11_KHR };
-    d3d_binding.device = xr.d3d_device;
+    if (!vr_get_system()) {
+        return false;
+    }
+    vr_log_system_properties();
 
+    // --- Graphics requirements (the runtime refuses the session unless they were queried) ---
+    std::string why;
+    if (!xr.gfx->CheckRequirements(xr.instance, xr.system_id, &why)) {
+        spdlog::error("[VR] {} can't drive this OpenXR runtime: {}", xr.gfx->ApiName(), why);
+        xrDestroyInstance(xr.instance);
+        xr.instance = XR_NULL_HANDLE;
+        return false;
+    }
+    return true;
+}
+
+// One XR swapchain of the given size + the backend's per-image color/depth targets for it.
+// The core keeps only the handle and size; the backend owns every API object.
+static bool vr_create_swapchain(vrgfx::Target t, decltype(xr.hud_swapchain)& sc, uint32_t w, uint32_t h, int64_t fmt,
+                                const char* label) {
+    sc.width = w;
+    sc.height = h;
+    sc.format = fmt;
+
+    XrSwapchainCreateInfo swapchain_ci = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
+    swapchain_ci.usageFlags =
+        XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT | xr.gfx->ExtraUsageFlags();
+    swapchain_ci.format = fmt;
+    swapchain_ci.sampleCount = 1;
+    swapchain_ci.width = w;
+    swapchain_ci.height = h;
+    swapchain_ci.faceCount = 1;
+    swapchain_ci.arraySize = 1;
+    swapchain_ci.mipCount = 1;
+
+    const std::string what = std::string("xrCreateSwapchain (") + label + ")";
+    if (!xr_check(xrCreateSwapchain(xr.session, &swapchain_ci, &sc.handle), what.c_str())) {
+        return false;
+    }
+    if (!xr.gfx->Attach(t, sc.handle, w, h, fmt)) {
+        spdlog::error("[VR] {} swapchain: building render targets failed", label);
+        return false;
+    }
+    uint32_t image_count = 0;
+    xrEnumerateSwapchainImages(sc.handle, 0, &image_count, nullptr);
+    spdlog::info("[VR] {} swapchain: {}x{}, {} images", label, w, h, image_count);
+    return true;
+}
+
+// Binding, session, spaces, swapchains.
+static bool vr_session_init() {
+    // --- Create Session ---
     XrSessionCreateInfo session_ci = { XR_TYPE_SESSION_CREATE_INFO };
-    session_ci.next = &d3d_binding;
+    session_ci.next = xr.gfx->SessionBinding();
     session_ci.systemId = xr.system_id;
     if (!xr_check(xrCreateSession(xr.instance, &session_ci, &xr.session), "xrCreateSession")) {
         xrDestroyInstance(xr.instance);
@@ -1159,37 +1501,14 @@ bool vr_init() {
     xrEnumerateSwapchainFormats(xr.session, 0, &format_count, nullptr);
     std::vector<int64_t> formats(format_count);
     xrEnumerateSwapchainFormats(xr.session, format_count, &format_count, formats.data());
-
-    // The game outputs gamma-encoded (sRGB) colors. The swapchain must be created with an
-    // SRGB format so the compositor decodes them correctly; a UNORM swapchain makes the
-    // compositor treat gamma values as linear and re-encode them, washing the image out.
-    // Writes still go through a UNORM view (below) so the bits land in the texture verbatim.
-    int64_t chosen_format = formats[0]; // fallback to first supported
-    for (int64_t fmt : formats) {
-        if (fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
-            chosen_format = fmt;
-            break;
-        }
+    if (formats.empty()) {
+        spdlog::error("[VR] The runtime offers no swapchain formats");
+        vr_shutdown();
+        return false;
     }
-    if (chosen_format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
-        // SRGB not available — pick UNORM as next best, accept the gamma mismatch for now
-        for (int64_t fmt : formats) {
-            if (fmt == DXGI_FORMAT_R8G8B8A8_UNORM) {
-                chosen_format = fmt;
-                break;
-            }
-        }
-    }
-    // OpenXR D3D11 swapchain textures are allocated typeless, so views may use either
-    // variant of the format family. Using the UNORM variant for RTVs/SRVs stores and
-    // reads the game's already-gamma-encoded output without any extra conversion.
-    DXGI_FORMAT view_format = (chosen_format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
-                                  ? DXGI_FORMAT_R8G8B8A8_UNORM
-                                  : static_cast<DXGI_FORMAT>(chosen_format);
-    xr.view_format = view_format;
-    spdlog::info("[VR] Swapchain format: {} (UNORM={}, SRGB={}), view format: {}",
-                 chosen_format, (int)DXGI_FORMAT_R8G8B8A8_UNORM, (int)DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
-                 (int)view_format);
+    // The backend applies the sRGB rule (vr_gfx.h): an sRGB swapchain the compositor decodes,
+    // written verbatim; UNORM fallback with a gamma mismatch.
+    const int64_t chosen_format = xr.gfx->ChooseColorFormat(formats);
 
     // --- Create Swapchains (one per eye) ---
     for (uint32_t eye = 0; eye < 2; eye++) {
@@ -1203,120 +1522,14 @@ bool vr_init() {
         if (scaled_w > xr.config_views[eye].maxImageRectWidth) scaled_w = xr.config_views[eye].maxImageRectWidth;
         if (scaled_h > xr.config_views[eye].maxImageRectHeight) scaled_h = xr.config_views[eye].maxImageRectHeight;
 
-        sc.width = scaled_w;
-        sc.height = scaled_h;
-        sc.format = chosen_format;
-
-        spdlog::info("[VR] Eye {} render resolution: {}x{} (recommended {}x{}, scale {:.2f})", eye, sc.width, sc.height,
+        spdlog::info("[VR] Eye {} render resolution: {}x{} (recommended {}x{}, scale {:.2f})", eye, scaled_w, scaled_h,
                      xr.config_views[eye].recommendedImageRectWidth, xr.config_views[eye].recommendedImageRectHeight,
                      xr.resolution_scale);
 
-        XrSwapchainCreateInfo swapchain_ci = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
-        swapchain_ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-        swapchain_ci.format = chosen_format;
-        swapchain_ci.sampleCount = 1;
-        swapchain_ci.width = sc.width;
-        swapchain_ci.height = sc.height;
-        swapchain_ci.faceCount = 1;
-        swapchain_ci.arraySize = 1;
-        swapchain_ci.mipCount = 1;
-
-        if (!xr_check(xrCreateSwapchain(xr.session, &swapchain_ci, &sc.handle), "xrCreateSwapchain")) {
+        if (!vr_create_swapchain(eye == 0 ? vrgfx::Target::Eye0 : vrgfx::Target::Eye1, sc, scaled_w, scaled_h,
+                                 chosen_format, eye == 0 ? "eye 0" : "eye 1")) {
             vr_shutdown();
             return false;
-        }
-
-        // Enumerate swapchain images
-        uint32_t image_count = 0;
-        xrEnumerateSwapchainImages(sc.handle, 0, &image_count, nullptr);
-        sc.images.resize(image_count, { XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR });
-        xrEnumerateSwapchainImages(sc.handle, image_count, &image_count,
-                                   reinterpret_cast<XrSwapchainImageBaseHeader*>(sc.images.data()));
-
-        // Create RTVs and depth resources for each swapchain image
-        sc.rtvs.resize(image_count);
-        sc.dsvs.resize(image_count);
-        sc.depth_textures.resize(image_count);
-
-        for (uint32_t i = 0; i < image_count; i++) {
-            // RTV
-            D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
-            rtv_desc.Format = view_format;
-            rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-            rtv_desc.Texture2D.MipSlice = 0;
-            HRESULT hr = xr.d3d_device->CreateRenderTargetView(
-                sc.images[i].texture, &rtv_desc, sc.rtvs[i].GetAddressOf());
-            if (FAILED(hr)) {
-                spdlog::error("[VR] Failed to create RTV for eye {} image {}", eye, i);
-                vr_shutdown();
-                return false;
-            }
-
-            // Depth texture
-            D3D11_TEXTURE2D_DESC depth_desc = {};
-            depth_desc.Width = sc.width;
-            depth_desc.Height = sc.height;
-            depth_desc.MipLevels = 1;
-            depth_desc.ArraySize = 1;
-            depth_desc.Format = DXGI_FORMAT_D32_FLOAT;
-            depth_desc.SampleDesc.Count = 1;
-            depth_desc.Usage = D3D11_USAGE_DEFAULT;
-            depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
-
-            hr = xr.d3d_device->CreateTexture2D(&depth_desc, nullptr, sc.depth_textures[i].GetAddressOf());
-            if (FAILED(hr)) {
-                spdlog::error("[VR] Failed to create depth texture for eye {} image {}", eye, i);
-                vr_shutdown();
-                return false;
-            }
-
-            // DSV
-            D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc = {};
-            dsv_desc.Format = DXGI_FORMAT_D32_FLOAT;
-            dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
-            dsv_desc.Texture2D.MipSlice = 0;
-
-            hr = xr.d3d_device->CreateDepthStencilView(
-                sc.depth_textures[i].Get(), &dsv_desc, sc.dsvs[i].GetAddressOf());
-            if (FAILED(hr)) {
-                spdlog::error("[VR] Failed to create DSV for eye {} image {}", eye, i);
-                vr_shutdown();
-                return false;
-            }
-        }
-
-        spdlog::info("[VR] Eye {} swapchain: {}x{}, {} images", eye, sc.width, sc.height, image_count);
-    }
-
-    // --- Create desktop mirror texture (a copy of the left eye, shown in the companion window) ---
-    {
-        const auto& eye0 = xr.eye_swapchains[0];
-        D3D11_TEXTURE2D_DESC desc = {};
-        desc.Width = eye0.width;
-        desc.Height = eye0.height;
-        desc.MipLevels = 1;
-        desc.ArraySize = 1;
-        desc.Format = view_format;
-        desc.SampleDesc.Count = 1;
-        desc.Usage = D3D11_USAGE_DEFAULT;
-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-
-        HRESULT hr = xr.d3d_device->CreateTexture2D(&desc, nullptr, xr.mirror_texture.ReleaseAndGetAddressOf());
-        if (SUCCEEDED(hr)) {
-            D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-            srv_desc.Format = view_format;
-            srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-            srv_desc.Texture2D.MipLevels = 1;
-            hr = xr.d3d_device->CreateShaderResourceView(xr.mirror_texture.Get(), &srv_desc,
-                                                         xr.mirror_srv.ReleaseAndGetAddressOf());
-        }
-        if (FAILED(hr)) {
-            // Non-fatal: the headset still renders, the companion window just won't show the mirror.
-            spdlog::warn("[VR] Failed to create desktop mirror texture; companion window will be blank");
-            xr.mirror_texture.Reset();
-            xr.mirror_srv.Reset();
-        } else {
-            spdlog::info("[VR] Desktop mirror texture: {}x{}", eye0.width, eye0.height);
         }
     }
 
@@ -1329,179 +1542,18 @@ bool vr_init() {
         return false;
     }
 
-    // --- Create HUD swapchain (2048x1536, 4:3) ---
+    // --- HUD swapchain (2048x1536, 4:3) ---
     // Twice the old 1024x768: the wrist layout packs each hand's canvas at half scale (twice the
     // room for moved / enlarged elements), and this keeps those elements as sharp as before.
-    {
-        auto& sc = xr.hud_swapchain;
-        sc.width = 2048;
-        sc.height = 1536;
-        sc.format = chosen_format;
-
-        XrSwapchainCreateInfo swapchain_ci = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
-        swapchain_ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-        swapchain_ci.format = chosen_format;
-        swapchain_ci.sampleCount = 1;
-        swapchain_ci.width = sc.width;
-        swapchain_ci.height = sc.height;
-        swapchain_ci.faceCount = 1;
-        swapchain_ci.arraySize = 1;
-        swapchain_ci.mipCount = 1;
-
-        if (!xr_check(xrCreateSwapchain(xr.session, &swapchain_ci, &sc.handle), "xrCreateSwapchain (HUD)")) {
-            vr_shutdown();
-            return false;
-        }
-
-        uint32_t image_count = 0;
-        xrEnumerateSwapchainImages(sc.handle, 0, &image_count, nullptr);
-        sc.images.resize(image_count, { XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR });
-        xrEnumerateSwapchainImages(sc.handle, image_count, &image_count,
-                                   reinterpret_cast<XrSwapchainImageBaseHeader*>(sc.images.data()));
-
-        sc.rtvs.resize(image_count);
-        sc.dsvs.resize(image_count);
-        sc.depth_textures.resize(image_count);
-
-        for (uint32_t i = 0; i < image_count; i++) {
-            D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
-            rtv_desc.Format = view_format;
-            rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-            xr.d3d_device->CreateRenderTargetView(sc.images[i].texture, &rtv_desc, sc.rtvs[i].GetAddressOf());
-
-            D3D11_TEXTURE2D_DESC depth_desc = {};
-            depth_desc.Width = sc.width;
-            depth_desc.Height = sc.height;
-            depth_desc.MipLevels = 1;
-            depth_desc.ArraySize = 1;
-            depth_desc.Format = DXGI_FORMAT_D32_FLOAT;
-            depth_desc.SampleDesc.Count = 1;
-            depth_desc.Usage = D3D11_USAGE_DEFAULT;
-            depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
-            xr.d3d_device->CreateTexture2D(&depth_desc, nullptr, sc.depth_textures[i].GetAddressOf());
-
-            D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc = {};
-            dsv_desc.Format = DXGI_FORMAT_D32_FLOAT;
-            dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
-            xr.d3d_device->CreateDepthStencilView(sc.depth_textures[i].Get(), &dsv_desc, sc.dsvs[i].GetAddressOf());
-        }
-        spdlog::info("[VR] HUD swapchain: {}x{}, {} images", sc.width, sc.height, image_count);
-    }
-
-    // --- Create flat-screen swapchain (whole-frame panel for 2D contexts: file select, pause) ---
-    {
-        auto& sc = xr.screen_swapchain;
-        sc.width = 1280;
-        sc.height = 960;
-        sc.format = chosen_format;
-
-        XrSwapchainCreateInfo swapchain_ci = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
-        swapchain_ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-        swapchain_ci.format = chosen_format;
-        swapchain_ci.sampleCount = 1;
-        swapchain_ci.width = sc.width;
-        swapchain_ci.height = sc.height;
-        swapchain_ci.faceCount = 1;
-        swapchain_ci.arraySize = 1;
-        swapchain_ci.mipCount = 1;
-
-        if (!xr_check(xrCreateSwapchain(xr.session, &swapchain_ci, &sc.handle), "xrCreateSwapchain (screen)")) {
-            vr_shutdown();
-            return false;
-        }
-
-        uint32_t image_count = 0;
-        xrEnumerateSwapchainImages(sc.handle, 0, &image_count, nullptr);
-        sc.images.resize(image_count, { XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR });
-        xrEnumerateSwapchainImages(sc.handle, image_count, &image_count,
-                                   reinterpret_cast<XrSwapchainImageBaseHeader*>(sc.images.data()));
-
-        sc.rtvs.resize(image_count);
-        sc.dsvs.resize(image_count);
-        sc.depth_textures.resize(image_count);
-
-        for (uint32_t i = 0; i < image_count; i++) {
-            D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
-            rtv_desc.Format = view_format;
-            rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-            xr.d3d_device->CreateRenderTargetView(sc.images[i].texture, &rtv_desc, sc.rtvs[i].GetAddressOf());
-
-            D3D11_TEXTURE2D_DESC depth_desc = {};
-            depth_desc.Width = sc.width;
-            depth_desc.Height = sc.height;
-            depth_desc.MipLevels = 1;
-            depth_desc.ArraySize = 1;
-            depth_desc.Format = DXGI_FORMAT_D32_FLOAT;
-            depth_desc.SampleDesc.Count = 1;
-            depth_desc.Usage = D3D11_USAGE_DEFAULT;
-            depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
-            xr.d3d_device->CreateTexture2D(&depth_desc, nullptr, sc.depth_textures[i].GetAddressOf());
-
-            D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc = {};
-            dsv_desc.Format = DXGI_FORMAT_D32_FLOAT;
-            dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
-            xr.d3d_device->CreateDepthStencilView(sc.depth_textures[i].Get(), &dsv_desc, sc.dsvs[i].GetAddressOf());
-        }
-        spdlog::info("[VR] Screen swapchain: {}x{}, {} images", sc.width, sc.height, image_count);
-    }
-
-    // --- Create text-panel swapchain. 4:3 like the HUD, so the interpreter's 2D aspect handling is
-    // the identity and every texrect lands exactly where vanilla put it; the layer then crops its
+    // --- Flat-screen swapchain (whole-frame panel for 2D contexts: N64 logo, title) ---
+    // --- Text-panel swapchain. 4:3 like the HUD, so the interpreter's 2D aspect handling is the
+    // identity and every texrect lands exactly where vanilla put it; the layer then crops its
     // imageRect to the text box. Higher resolution than the HUD: this one is read word by word.
-    {
-        auto& sc = xr.text_swapchain;
-        sc.width = 1280;
-        sc.height = 960;
-        sc.format = chosen_format;
-
-        XrSwapchainCreateInfo swapchain_ci = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
-        swapchain_ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-        swapchain_ci.format = chosen_format;
-        swapchain_ci.sampleCount = 1;
-        swapchain_ci.width = sc.width;
-        swapchain_ci.height = sc.height;
-        swapchain_ci.faceCount = 1;
-        swapchain_ci.arraySize = 1;
-        swapchain_ci.mipCount = 1;
-
-        if (!xr_check(xrCreateSwapchain(xr.session, &swapchain_ci, &sc.handle), "xrCreateSwapchain (text)")) {
-            vr_shutdown();
-            return false;
-        }
-
-        uint32_t image_count = 0;
-        xrEnumerateSwapchainImages(sc.handle, 0, &image_count, nullptr);
-        sc.images.resize(image_count, { XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR });
-        xrEnumerateSwapchainImages(sc.handle, image_count, &image_count,
-                                   reinterpret_cast<XrSwapchainImageBaseHeader*>(sc.images.data()));
-
-        sc.rtvs.resize(image_count);
-        sc.dsvs.resize(image_count);
-        sc.depth_textures.resize(image_count);
-
-        for (uint32_t i = 0; i < image_count; i++) {
-            D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
-            rtv_desc.Format = view_format;
-            rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-            xr.d3d_device->CreateRenderTargetView(sc.images[i].texture, &rtv_desc, sc.rtvs[i].GetAddressOf());
-
-            D3D11_TEXTURE2D_DESC depth_desc = {};
-            depth_desc.Width = sc.width;
-            depth_desc.Height = sc.height;
-            depth_desc.MipLevels = 1;
-            depth_desc.ArraySize = 1;
-            depth_desc.Format = DXGI_FORMAT_D32_FLOAT;
-            depth_desc.SampleDesc.Count = 1;
-            depth_desc.Usage = D3D11_USAGE_DEFAULT;
-            depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
-            xr.d3d_device->CreateTexture2D(&depth_desc, nullptr, sc.depth_textures[i].GetAddressOf());
-
-            D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc = {};
-            dsv_desc.Format = DXGI_FORMAT_D32_FLOAT;
-            dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
-            xr.d3d_device->CreateDepthStencilView(sc.depth_textures[i].Get(), &dsv_desc, sc.dsvs[i].GetAddressOf());
-        }
-        spdlog::info("[VR] Text swapchain: {}x{}, {} images", sc.width, sc.height, image_count);
+    if (!vr_create_swapchain(vrgfx::Target::Hud, xr.hud_swapchain, 2048, 1536, chosen_format, "HUD") ||
+        !vr_create_swapchain(vrgfx::Target::Screen, xr.screen_swapchain, 1280, 960, chosen_format, "screen") ||
+        !vr_create_swapchain(vrgfx::Target::Text, xr.text_swapchain, 1280, 960, chosen_format, "text")) {
+        vr_shutdown();
+        return false;
     }
 
     // Initialize views
@@ -1520,35 +1572,19 @@ void vr_shutdown() {
     xr.session_running = false;
     vrphys_reset();
 
-    for (uint32_t eye = 0; eye < 2; eye++) {
-        auto& sc = xr.eye_swapchains[eye];
-        sc.rtvs.clear();
-        sc.dsvs.clear();
-        sc.depth_textures.clear();
-        sc.images.clear();
-        if (sc.handle != XR_NULL_HANDLE) {
-            xrDestroySwapchain(sc.handle);
-            sc.handle = XR_NULL_HANDLE;
+    // The backend's views/depth/mirror copies go first, then the swapchains they were built on.
+    if (xr.gfx) {
+        xr.gfx->Shutdown();
+        xr.gfx.reset();
+    }
+    for (auto* sc : { &xr.eye_swapchains[0], &xr.eye_swapchains[1], &xr.hud_swapchain, &xr.screen_swapchain,
+                      &xr.text_swapchain }) {
+        if (sc->handle != XR_NULL_HANDLE) {
+            xrDestroySwapchain(sc->handle);
+            sc->handle = XR_NULL_HANDLE;
         }
     }
-
-    {
-        auto& sc = xr.hud_swapchain;
-        sc.rtvs.clear(); sc.dsvs.clear(); sc.depth_textures.clear(); sc.images.clear();
-        if (sc.handle != XR_NULL_HANDLE) { xrDestroySwapchain(sc.handle); sc.handle = XR_NULL_HANDLE; }
-    }
-
-    {
-        auto& sc = xr.screen_swapchain;
-        sc.rtvs.clear(); sc.dsvs.clear(); sc.depth_textures.clear(); sc.images.clear();
-        if (sc.handle != XR_NULL_HANDLE) { xrDestroySwapchain(sc.handle); sc.handle = XR_NULL_HANDLE; }
-    }
-
-    {
-        auto& sc = xr.text_swapchain;
-        sc.rtvs.clear(); sc.dsvs.clear(); sc.depth_textures.clear(); sc.images.clear();
-        if (sc.handle != XR_NULL_HANDLE) { xrDestroySwapchain(sc.handle); sc.handle = XR_NULL_HANDLE; }
-    }
+    xr.hud_commands = nullptr;
     xr.text_commands = nullptr;
     xr.text_has_image = false;
     xr.text_was_visible = false;
@@ -1557,13 +1593,6 @@ void vr_shutdown() {
     xr.flat_screen = false;
     xr.flat_screen_prev = false;
 
-    xr.mirror_srv.Reset();
-    xr.mirror_texture.Reset();
-    for (auto& c : xr.layer_copy) {
-        c.srv.Reset();
-        c.tex.Reset();
-        c.w = c.h = 0;
-    }
     xr.mirror_quad_count = 0;
     if (xr.view_space != XR_NULL_HANDLE) {
         xrDestroySpace(xr.view_space);
@@ -1662,6 +1691,20 @@ void vr_get_frame_stats(VrFrameStats* out) {
     }
 }
 
+// Close a frame opened by xrBeginFrame without submitting anything. The spec requires an xrEndFrame
+// for every xrBeginFrame, with zero layers when shouldRender is false. A runtime that waits for the
+// app's first ended frame before taking the session out of SYNCHRONIZED (where shouldRender is
+// false) would otherwise never make it visible: the app shows as running, the headset shows nothing.
+static void vr_end_frame_empty() {
+    xr.frame_began = false;
+    XrFrameEndInfo end_info = { XR_TYPE_FRAME_END_INFO };
+    end_info.displayTime = xr.frame_state.predictedDisplayTime;
+    end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    end_info.layerCount = 0;
+    end_info.layers = nullptr;
+    xr_check(xrEndFrame(xr.session, &end_info), "xrEndFrame (no layers)");
+}
+
 bool vr_begin_frame() {
     if (!xr.initialized || !xr.enabled) return false;
 
@@ -1695,7 +1738,10 @@ bool vr_begin_frame() {
     }
     xr.frame_began = true;
 
+    // The caller only ends frames this returns true for, so every early-out past xrBeginFrame closes
+    // the frame itself (vr_end_frame_empty).
     if (!xr.frame_state.shouldRender) {
+        vr_end_frame_empty();
         return false;
     }
 
@@ -1719,6 +1765,7 @@ bool vr_begin_frame() {
     XrResult result = xrLocateViews(xr.session, &view_locate_info, &view_state, 2, &view_count, xr.views);
     if (!XR_SUCCEEDED(result)) {
         spdlog::warn("[VR] xrLocateViews failed");
+        vr_end_frame_empty();
         return false;
     }
 
@@ -1823,9 +1870,21 @@ bool vr_begin_frame() {
             snap_latch = 0;
         } else if (snap_latch == 0 && fabsf(sx) > 0.6f) {
             snap_latch = (sx > 0.0f) ? 1 : -1;
-            vr_apply_snap_turn(snap_latch * CVarGetFloat("gVrSnapTurnDegrees", 45.0f));
+            // Latched, committed at the next game tick (see g_snap_pending_deg).
+            g_snap_pending_deg += snap_latch * CVarGetFloat("gVrSnapTurnDegrees", 45.0f);
+            g_snap_pending_frames = 0;
         } else if (snap_latch != 0 && fabsf(sx) < 0.3f) {
             snap_latch = 0;
+        }
+    }
+    // Backstop: a game that stops ticking (load hitch, a state that never calls VR_GameTickBegin)
+    // must not swallow the snap. Past ~0.2 s it applies here like it always used to.
+    if (g_snap_pending_deg != 0.0f && ++g_snap_pending_frames > (int)(0.2f * (float)vr_get_refresh_rate())) {
+        const float deg = g_snap_pending_deg;
+        g_snap_pending_deg = 0.0f;
+        g_snap_pending_frames = 0;
+        if (xr.input_initialized && !xr.flat_screen && xr.first_person && !g_turn_suppressed) {
+            vr_apply_snap_turn(deg);
         }
     }
 
@@ -2029,8 +2088,10 @@ static XrPosef text_panel_place(bool snap, float dt) {
         xr.text_fwd = glm::vec3(0.0f, 0.0f, -1.0f);
     }
 
-    const float dist = std::clamp(CVarGetFloat("gVrTextDistance", 1.4f), 0.4f, 4.0f);
-    const glm::vec3 target = head + xr.text_fwd * dist + glm::vec3(0.0f, CVarGetFloat("gVrTextHeight", -0.15f), 0.0f);
+    const float dist = std::clamp(xr.text_layout[1] > 0.0f ? xr.text_layout[1] : CVarGetFloat("gVrTextDistance", 1.4f),
+                                  0.4f, 6.0f);
+    const float lift = xr.text_layout[0] > 0.0f ? xr.text_layout[2] : CVarGetFloat("gVrTextHeight", -0.15f);
+    const glm::vec3 target = head + xr.text_fwd * dist + glm::vec3(0.0f, lift, 0.0f);
 
     if (snap) {
         xr.text_pos = target;
@@ -2364,10 +2425,8 @@ void vr_end_frame() {
         }
     }
 
-    // HUD quad layer (alpha-blended). Attachment via gVrHudAttach: 0 = head-locked (classic),
-    // 1/2 = pinned to the left/right controller like a wrist panel. Hand modes use the RAW grip
-    // pose in local_space (compositor quads must not carry the artificial snap-turn) and fall back
-    // to head-locked while that hand is untracked.
+    // Classic HUD quad layer (alpha-blended): the whole HUD head-locked in front of the eyes. The
+    // hand-attached classic modes were removed; the wrist layout below replaces them.
     XrCompositionLayerQuad hud_layer = { XR_TYPE_COMPOSITION_LAYER_QUAD };
     hud_layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
     hud_layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
@@ -2379,35 +2438,11 @@ void vr_end_frame() {
     };
     hud_layer.subImage.imageArrayIndex = 0;
 
-    float hud_width;
-    const int hud_attach = CVarGetInteger("gVrHudAttach", 0);
-    const int hud_hand = hud_attach - 1;
-    if ((hud_attach == 1 || hud_attach == 2) && xr.hand_active[hud_hand]) {
-        const float kDeg = 3.14159265358979323846f / 180.0f;
-        const XrPosef& gp = xr.grip_pose_raw[hud_hand];
-        const glm::quat gq(gp.orientation.w, gp.orientation.x, gp.orientation.y, gp.orientation.z);
-        // Positional offset in the grip frame (meters), mirrored in X for the right hand so one
-        // tuning works symmetrically on either side.
-        glm::vec3 off(CVarGetFloat("gVrHudHandOffX", 0.0f), CVarGetFloat("gVrHudHandOffY", 0.10f),
-                      CVarGetFloat("gVrHudHandOffZ", -0.08f));
-        if (hud_hand == 1) {
-            off.x = -off.x;
-        }
-        const glm::vec3 p = glm::vec3(gp.position.x, gp.position.y, gp.position.z) + gq * off;
-        // Tilt about the grip X axis so the panel faces the player's eyes at a natural wrist angle.
-        const glm::quat q =
-            gq * glm::angleAxis(CVarGetFloat("gVrHudHandPitch", -40.0f) * kDeg, glm::vec3(1.0f, 0.0f, 0.0f));
-        hud_layer.space = xr.local_space;
-        hud_layer.pose.position = { p.x, p.y, p.z };
-        hud_layer.pose.orientation = { q.x, q.y, q.z, q.w };
-        hud_width = CVarGetFloat("gVrHudHandSize", 0.35f);
-    } else {
-        hud_layer.space = xr.view_space;
-        hud_layer.pose = { { 0, 0, 0, 1 },
-                           { CVarGetFloat("gVrHudOffX", 0.0f), CVarGetFloat("gVrHudOffY", 0.0f),
-                             -CVarGetFloat("gVrHudDistance", 2.0f) } };
-        hud_width = CVarGetFloat("gVrHudSize", 1.5f);
-    }
+    hud_layer.space = xr.view_space;
+    hud_layer.pose = { { 0, 0, 0, 1 },
+                       { CVarGetFloat("gVrHudOffX", 0.0f), CVarGetFloat("gVrHudOffY", 0.0f),
+                         -CVarGetFloat("gVrHudDistance", 2.0f) } };
+    float hud_width = CVarGetFloat("gVrHudSize", 1.5f);
     if (hud_width < 0.05f) {
         hud_width = 0.05f;
     }
@@ -2416,8 +2451,8 @@ void vr_end_frame() {
     // Wrist layout: crops of the same HUD image, one stack per controller — vitals on the LEFT,
     // buttons over the minimap on the RIGHT (physical hands by design, not handedness). Each crop
     // is sized at a fixed metres-per-native-pixel, so every element keeps the same real size
-    // whatever the crop; the stack is centred on the same grip anchor/tilt as the classic hand HUD
-    // (gVrHudHandOff*, gVrHudHandPitch, X mirrored on the right). A hand that isn't tracked shows
+    // whatever the crop; each panel is placed on its grip by the per-profile gVrHud.<Adult|Child>.
+    // <Left|Right>Panel.* settings (vr_hud_settings.h). A hand that isn't tracked shows
     // nothing (no head-locked fallback), a group that's faded out or not drawn drops out of its stack.
     // World-space pause: the whole HUD image on one world-anchored quad framing the front page
     // (VR_SetHudWorldPanel); replaces both the wrist stacks and the classic quad meanwhile.
@@ -2434,8 +2469,10 @@ void vr_end_frame() {
                                                       (int32_t)xr.hud_swapchain.height };
         hud_world_layer.subImage.imageArrayIndex = 0;
         hud_world_layer.pose = game_world_to_raw(xr.hud_world_center, xr.hud_world_yaw);
-        hud_world_layer.size = { std::max(xr.hud_world_size[0] / ws, 0.01f),
-                                 std::max(xr.hud_world_size[1] / ws, 0.01f) };
+        float canvas[3];
+        vr_hud_world_canvas(canvas);
+        hud_world_layer.size = { std::max(xr.hud_world_size[0] * canvas[0] / ws, 0.01f),
+                                 std::max(xr.hud_world_size[1] * canvas[1] / ws, 0.01f) };
     }
 
     XrCompositionLayerQuad wrist_layers[2];
@@ -2513,7 +2550,8 @@ void vr_end_frame() {
         const float dt = xr.frame_state.predictedDisplayPeriod > 0
                              ? std::min((float)((double)xr.frame_state.predictedDisplayPeriod * 1e-9), 1.0f / 30.0f)
                              : 1.0f / (float)vr_get_refresh_rate();
-        const float tw = std::clamp(CVarGetFloat("gVrTextWidth", 0.9f), 0.2f, 3.0f);
+        const float tw = std::clamp(xr.text_layout[0] > 0.0f ? xr.text_layout[0] : CVarGetFloat("gVrTextWidth", 0.9f),
+                                    0.2f, 5.0f);
 
         text_layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
         text_layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
@@ -2589,6 +2627,23 @@ void vr_end_frame() {
         mirror_rec(text_layer, 1);
     }
 
+    // Sub-image rects are computed top-left (and recorded that way for the mirror above). A backend
+    // whose runtime reads them bottom-left (vr_gfx.h SubImageYUp) gets them flipped here.
+    if (xr.gfx && xr.gfx->SubImageYUp()) {
+        for (uint32_t i = 0; i < layer_count; i++) {
+            if (layers[i]->type != XR_TYPE_COMPOSITION_LAYER_QUAD) {
+                continue;
+            }
+            auto* q = const_cast<XrCompositionLayerQuad*>(reinterpret_cast<const XrCompositionLayerQuad*>(layers[i]));
+            const XrSwapchain h = q->subImage.swapchain;
+            const uint32_t img_h = h == xr.text_swapchain.handle     ? xr.text_swapchain.height
+                                   : h == xr.screen_swapchain.handle ? xr.screen_swapchain.height
+                                                                     : xr.hud_swapchain.height;
+            q->subImage.imageRect.offset.y =
+                (int32_t)img_h - (q->subImage.imageRect.offset.y + q->subImage.imageRect.extent.height);
+        }
+    }
+
     XrFrameEndInfo end_info = { XR_TYPE_FRAME_END_INFO };
     end_info.displayTime = xr.frame_state.predictedDisplayTime;
     end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
@@ -2608,6 +2663,46 @@ void vr_end_frame() {
 // Per-eye
 // --------------------------------------------------------------------------
 
+static vrgfx::Target vr_eye_target(int eye) {
+    return eye == 0 ? vrgfx::Target::Eye0 : vrgfx::Target::Eye1;
+}
+
+// Dev test card (gVrGfxTestCard, VR-MULTI-API-PLAN.md 9.1), drawn into a target after the game:
+// corner patches TL red / TR green / BL blue / BR white, a 16-step grey ramp (0..255) along the
+// top, and a white arrow pointing up in the centre. One look answers orientation (incl. the wrist
+// sub-rects and the text crop), gamma (the ramp vs the same card on another API) and mirror flip.
+// Built from ClearColorRects only, so every backend gets it for free.
+static void vr_draw_test_card(vrgfx::Target t, uint32_t image, uint32_t w, uint32_t h) {
+    if (!CVarGetInteger("gVrGfxTestCard", 0) || w < 32 || h < 32) {
+        return;
+    }
+    const int32_t W = (int32_t)w, H = (int32_t)h;
+    auto fill = [&](int32_t x, int32_t y, int32_t rw, int32_t rh, float r, float g, float b) {
+        const vrgfx::Rect rc = { x, y, rw, rh };
+        const float c[4] = { r, g, b, 1.0f };
+        xr.gfx->ClearColorRects(t, image, &rc, 1, c);
+    };
+    const int32_t p = std::min(W, H) / 8;
+    fill(0, 0, p, p, 1.0f, 0.0f, 0.0f);         // top-left red
+    fill(W - p, 0, p, p, 0.0f, 1.0f, 0.0f);     // top-right green
+    fill(0, H - p, p, p, 0.0f, 0.0f, 1.0f);     // bottom-left blue
+    fill(W - p, H - p, p, p, 1.0f, 1.0f, 1.0f); // bottom-right white
+    for (int i = 0; i < 16; i++) {
+        const int32_t x0 = p + (W - 2 * p) * i / 16;
+        const int32_t x1 = p + (W - 2 * p) * (i + 1) / 16;
+        const float v = (float)(i * 17) / 255.0f; // byte values 0, 17, ..., 255 (stored verbatim)
+        fill(x0, 0, x1 - x0, p / 2, v, v, v);
+    }
+    const int32_t cx = W / 2, cy = H / 2, sz = std::min(W, H) / 3;
+    const int32_t rows = 12;
+    for (int k = 0; k < rows; k++) { // arrow head: tip at the top, widening downwards
+        const int32_t rw = std::max<int32_t>(1, sz * (k + 1) / rows);
+        fill(cx - rw / 2, cy - sz / 2 + (sz / 2) * k / rows, rw, std::max<int32_t>(1, (sz / 2) / rows + 1), 1.0f,
+             1.0f, 1.0f);
+    }
+    fill(cx - sz / 10, cy, sz / 5, sz / 2, 1.0f, 1.0f, 1.0f); // stem
+}
+
 void vr_begin_eye(int eye) {
     if (!xr.initialized) return;
     xr.current_eye = eye;
@@ -2626,28 +2721,9 @@ void vr_begin_eye(int eye) {
     wait_info.timeout = XR_INFINITE_DURATION;
     xr_check(xrWaitSwapchainImage(sc.handle, &wait_info), "xrWaitSwapchainImage");
 
-    // Bind render target
-    ID3D11RenderTargetView* rtv = sc.rtvs[image_index].Get();
-    ID3D11DepthStencilView* dsv = sc.dsvs[image_index].Get();
-    xr.d3d_context->OMSetRenderTargets(1, &rtv, dsv);
-
-    // Clear
-    float clear_color[] = { 0.0f, 0.0f, 0.0f, 1.0f };
-    xr.d3d_context->ClearRenderTargetView(rtv, clear_color);
-    xr.d3d_context->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
-
-    // Set viewport
-    D3D11_VIEWPORT viewport = {};
-    viewport.TopLeftX = 0;
-    viewport.TopLeftY = 0;
-    viewport.Width = static_cast<float>(sc.width);
-    viewport.Height = static_cast<float>(sc.height);
-    viewport.MinDepth = 0.0f;
-    viewport.MaxDepth = 1.0f;
-    xr.d3d_context->RSSetViewports(1, &viewport);
-
-    // Tell D3D11 backend the render target height so viewport Y-flip works correctly
-    gfx_d3d11_set_render_target_height(sc.height);
+    // Bind, clear (opaque black, depth 1.0), full viewport, renderer told the target size.
+    const float clear_color[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    xr.gfx->BeginPass(vr_eye_target(eye), image_index, clear_color);
     // Interpreter renders at the eye texture's size (replaces the old gfx_start_frame override)
     vr_apply_dimensions(sc.width, sc.height);
 }
@@ -2659,11 +2735,13 @@ void vr_end_eye(int eye) {
     // released below, the runtime owns the texture again and it's no longer safe to read. Skipped
     // on frames the companion window isn't presenting: this is a full-eye-resolution CopyResource
     // (tens of MB) and nothing would consume the result.
+    auto& sc = xr.eye_swapchains[eye];
+    vr_draw_test_card(vr_eye_target(eye), xr.current_image_index[eye], sc.width, sc.height);
     if (eye == 0 && xr.plan_present_desktop) {
         vr_capture_mirror();
     }
+    xr.gfx->EndPass(vr_eye_target(eye), xr.current_image_index[eye]);
 
-    auto& sc = xr.eye_swapchains[eye];
     XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
     xr_check(xrReleaseSwapchainImage(sc.handle, &release_info), "xrReleaseSwapchainImage");
 }
@@ -2880,25 +2958,99 @@ bool vr_is_initialized() {
     return xr.initialized && xr.enabled;
 }
 
+// vr_init retry window (vr_apply_mode_request): a headset that isn't available yet, or a session
+// being re-established after a loss, gets kVrRetryWindow of attempts before VR is turned off.
+static struct {
+    bool active;
+    bool reconnect; // re-establishing a lost session: every failure is worth retrying
+    std::chrono::steady_clock::time_point deadline;
+    std::chrono::steady_clock::time_point next;
+} g_vr_retry;
+static constexpr auto kVrRetryInterval = std::chrono::seconds(2);
+static constexpr auto kVrRetryWindow = std::chrono::seconds(60);
+
+// Drop an instance kept between retries (vr_instance_init keeps it while the headset is missing).
+static void vr_release_kept_instance() {
+    if (!xr.initialized && xr.instance != XR_NULL_HANDLE) {
+        xrDestroyInstance(xr.instance);
+        xr.instance = XR_NULL_HANDLE;
+    }
+}
+
 // Latch a pending VR<->flat mode request (CVar gVrEnabled). MUST be called at a game-tick boundary
 // only (graph.c, before the tick's display list is built): a DL built for one mode must never be
 // interpreted in the other, and toggling between xrBeginFrame/xrEndFrame would corrupt the session.
 void vr_apply_mode_request() {
     const bool want = CVarGetInteger("gVrEnabled", 1) != 0;
 
-    if (want && !xr.initialized) {
-        // Lazy init: launching with VR off never touches OpenXR (no SteamVR popup); the session is
-        // created the first time the player toggles in.
-        if (vr_init()) {
-            xr.reenable_fixup = true;
+    // A session the runtime lost or ended (flagged by the event pump or a *_LOST result) is torn
+    // down here, where no display list or XR frame is in flight. A lost one reconnects through the
+    // retry window below; an ended one (the player quit the runtime) turns VR off.
+    if (xr.initialized && (xr.session_lost || xr.session_exited)) {
+        const bool reconnect = !xr.session_exited;
+        spdlog::warn("[VR] OpenXR session {}: shutting it down{}", reconnect ? "lost" : "ended by the runtime",
+                     reconnect ? " and reconnecting" : ", VR off");
+        vr_shutdown();
+        if (reconnect) {
+            g_vr_retry.reconnect = true;
         } else {
-            // No runtime/headset available — flip the CVar back so the UI reflects reality.
             CVarSetInteger("gVrEnabled", 0);
         }
         return;
     }
 
+    if (want && !xr.initialized) {
+        // VR runs only on renderers with a VR graphics leaf (vr_backend_supported: DirectX 11 and
+        // OpenGL, not Metal). Anywhere else init is impossible: don't try, and leave the CVar alone.
+        if (!vr_backend_supported(vr_running_window_backend())) {
+            return;
+        }
+
+        // Lazy init: launching with VR off never touches OpenXR (no SteamVR popup); the session is
+        // created the first time the player toggles in. A headset that isn't available yet, or a
+        // lost session being re-established, is retried every kVrRetryInterval for kVrRetryWindow
+        // with the checkbox left on; only then, or on a failure retrying can't fix, does the CVar
+        // flip back so the UI reflects reality.
+        const auto now = std::chrono::steady_clock::now();
+        if (g_vr_retry.active && now < g_vr_retry.next) {
+            return;
+        }
+        if (vr_init()) {
+            if (g_vr_retry.active) {
+                spdlog::info("[VR] Headset connected");
+            }
+            g_vr_retry = {};
+            xr.reenable_fixup = true;
+            return;
+        }
+        if (xr.init_retryable || g_vr_retry.reconnect) {
+            if (!g_vr_retry.active) {
+                g_vr_retry.active = true;
+                g_vr_retry.deadline = now + kVrRetryWindow;
+                spdlog::warn("[VR] {}; retrying every {} s for up to {} s",
+                             xr.init_retryable ? "Headset not detected yet (put it on, wake it, or connect Link)"
+                                               : "Reconnecting to the OpenXR runtime",
+                             (long long)kVrRetryInterval.count(), (long long)kVrRetryWindow.count());
+            }
+            if (now < g_vr_retry.deadline) {
+                g_vr_retry.next = now + kVrRetryInterval;
+                return;
+            }
+            spdlog::error("[VR] No headset after {} s; VR turned off", (long long)kVrRetryWindow.count());
+        }
+        g_vr_retry = {};
+        vr_release_kept_instance();
+        CVarSetInteger("gVrEnabled", 0);
+        return;
+    }
+
     if (!xr.initialized) {
+        // VR switched off while not running: stop waiting and drop an instance kept for the retry.
+        if (g_vr_retry.active) {
+            spdlog::info("[VR] VR turned off; stopped waiting for the headset");
+        }
+        g_vr_retry = {};
+        vr_release_kept_instance();
         return;
     }
 
@@ -2906,8 +3058,11 @@ void vr_apply_mode_request() {
     // donning it again auto-resumes — unless the player opted to stay in VR (gVrStayOnDoff), the
     // runtime can't report presence, or VR is manually off anyway. Because this recomputes every
     // tick from (CVar, presence), manual F9 stays sticky while presence flips are symmetric.
+    // "Not worn" only counts once the runtime has reported "worn" this session: a disabled or
+    // unforwarded proximity sensor reads "not worn" forever and would keep VR off for good.
     const bool stay_on_doff = CVarGetInteger("gVrStayOnDoff", 0) != 0;
-    const bool effective = want && (xr.user_present || stay_on_doff || !xr.user_presence_supported);
+    const bool effective = want && (xr.user_present || stay_on_doff || !xr.user_presence_supported ||
+                                    !xr.presence_confirmed);
 
     if (effective && !xr.enabled) {
         xr.enabled = true;
@@ -3379,10 +3534,49 @@ void vr_register_head_child_matrix(const void* mtx, const float* local_mf16) {
     }
 }
 
+// The playspace frame in game-world coords (MtxF layout): origin at the anchor this render pass
+// uses (the same interpolated anchor the camera and hands compose with), axes = the playspace's
+// (world-aligned in first person; turned by gamma in third). Anything placed in it moves with
+// locomotion exactly as the hands and the view do, at render rate.
+bool vr_get_playspace_matrix(float out[4][4]) {
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+            out[r][c] = (r == c) ? 1.0f : 0.0f;
+    if (!xr.initialized || !xr.anchor_initialized) {
+        return false;
+    }
+    const glm::vec3 anchor = vr_anchor_now();
+    const float g = xr.anchor_gamma_prev + (xr.anchor_gamma - xr.anchor_gamma_prev) * xr.interp_alpha;
+    const float cg = cosf(g), sg = sinf(g);
+    // Columns of unyaw (see vr_get_head_matrix), then the translation.
+    out[0][0] = cg;
+    out[0][2] = sg;
+    out[2][0] = -sg;
+    out[2][2] = cg;
+    out[3][0] = anchor.x;
+    out[3][1] = anchor.y;
+    out[3][2] = anchor.z;
+    return true;
+}
+
+// Live playspace-CHILD matrices (the item selector's compass): registered with a playspace-LOCAL
+// transform; lookup returns (playspace now) x (local) per eye, so UI left floating where the hand
+// was rides joystick locomotion exactly like the hands, instead of through game-rate interpolation.
+static std::unordered_map<const void*, HandChildMtx> g_playspace_child_registry;
+
+void vr_register_playspace_child_matrix(const void* mtx, const float* local_mf16) {
+    if (mtx && local_mf16) {
+        HandChildMtx& e = g_playspace_child_registry[mtx];
+        e.hand = -1;
+        memcpy(e.local, local_mf16, sizeof(e.local));
+    }
+}
+
 void vr_clear_hand_matrices() {
     g_hand_mtx_registry.clear();
     g_hand_child_registry.clear();
     g_head_child_registry.clear();
+    g_playspace_child_registry.clear();
 }
 
 // out = parent COMPOSED WITH local (local applied to vertices first); MtxF [column][component].
@@ -3427,6 +3621,17 @@ bool vr_lookup_hand_matrix(const void* mtx, float out[4][4]) {
             return true;
         }
     }
+    if (!g_playspace_child_registry.empty()) {
+        auto it = g_playspace_child_registry.find(mtx);
+        if (it != g_playspace_child_registry.end()) {
+            float space[4][4];
+            if (!vr_get_playspace_matrix(space)) {
+                return false;
+            }
+            vr_compose_child(space, it->second.local, out);
+            return true;
+        }
+    }
     return false;
 }
 
@@ -3458,8 +3663,7 @@ int16_t vr_get_heading_yaw() {
         const float yaw = atan2f(fwd.x, fwd.z);
         s_last_heading = static_cast<int16_t>(yaw * (32768.0f / 3.14159265358979323846f));
     } // else: looking straight up/down, heading is degenerate — hold the last stable value
-    const int16_t manual = static_cast<int16_t>(CVarGetInteger("gVrHeadingManualOffset", 0));
-    return static_cast<int16_t>(s_last_heading + manual);
+    return s_last_heading;
 }
 
 void vr_recenter_heading(int16_t link_yaw) {
@@ -3491,11 +3695,7 @@ void vr_clear_current_eye_depth() {
     if (!xr.initialized || !xr.frame_began || xr.rendering_screen || xr.rendering_text || xr.rendering_hud) {
         return;
     }
-    auto& sc = xr.eye_swapchains[xr.current_eye];
-    ID3D11DepthStencilView* dsv = sc.dsvs[xr.current_image_index[xr.current_eye]].Get();
-    if (dsv != nullptr) {
-        xr.d3d_context->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
-    }
+    xr.gfx->ClearDepth(vr_eye_target(xr.current_eye), xr.current_image_index[xr.current_eye]);
 }
 
 void vr_rebind_current_eye_target() {
@@ -3504,82 +3704,25 @@ void vr_rebind_current_eye_target() {
     // Restore whichever target is ACTUALLY being rendered: the flat-screen panel or the HUD when a
     // 2D pass is active (the pause menu runs framebuffer copies mid-pass — blindly rebinding an eye
     // here used to dump the inventory into the stale right-eye image), else the current eye.
-    ID3D11RenderTargetView* rtv;
-    ID3D11DepthStencilView* dsv;
-    uint32_t height;
     if (xr.rendering_screen) {
-        auto& sc = xr.screen_swapchain;
-        rtv = sc.rtvs[xr.screen_image_index].Get();
-        dsv = sc.dsvs[xr.screen_image_index].Get();
-        height = sc.height;
+        xr.gfx->Rebind(vrgfx::Target::Screen, xr.screen_image_index);
     } else if (xr.rendering_text) {
-        auto& sc = xr.text_swapchain;
-        rtv = sc.rtvs[xr.text_image_index].Get();
-        dsv = sc.dsvs[xr.text_image_index].Get();
-        height = sc.height;
+        xr.gfx->Rebind(vrgfx::Target::Text, xr.text_image_index);
     } else if (xr.rendering_hud) {
-        auto& sc = xr.hud_swapchain;
-        rtv = sc.rtvs[xr.hud_image_index].Get();
-        dsv = sc.dsvs[xr.hud_image_index].Get();
-        height = sc.height;
+        xr.gfx->Rebind(vrgfx::Target::Hud, xr.hud_image_index);
     } else {
-        auto& sc = xr.eye_swapchains[xr.current_eye];
-        uint32_t idx = xr.current_image_index[xr.current_eye];
-        rtv = sc.rtvs[idx].Get();
-        dsv = sc.dsvs[idx].Get();
-        height = sc.height;
+        xr.gfx->Rebind(vr_eye_target(xr.current_eye), xr.current_image_index[xr.current_eye]);
     }
-    xr.d3d_context->OMSetRenderTargets(1, &rtv, dsv);
-    gfx_d3d11_set_render_target_height(height);
 }
 
 // --------------------------------------------------------------------------
 // HUD overlay
 // --------------------------------------------------------------------------
 
-// Keep a readable copy of a 2D layer's image for the desktop mirror (call while still acquired).
-static void vr_copy_layer_image(int slot, ID3D11Texture2D* src) {
-    if (src == nullptr) {
-        return;
-    }
-    auto& c = xr.layer_copy[slot];
-    D3D11_TEXTURE2D_DESC sd;
-    src->GetDesc(&sd);
-    if (!c.tex || c.w != sd.Width || c.h != sd.Height) {
-        D3D11_TEXTURE2D_DESC d = sd;
-        d.MipLevels = 1;
-        d.ArraySize = 1;
-        d.SampleDesc.Count = 1;
-        d.SampleDesc.Quality = 0;
-        d.Usage = D3D11_USAGE_DEFAULT;
-        d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        d.CPUAccessFlags = 0;
-        d.MiscFlags = 0;
-        c.srv.Reset();
-        c.tex.Reset();
-        if (FAILED(xr.d3d_device->CreateTexture2D(&d, nullptr, c.tex.GetAddressOf()))) {
-            c.tex.Reset();
-            return;
-        }
-        D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-        srv_desc.Format = xr.view_format;
-        srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        srv_desc.Texture2D.MipLevels = 1;
-        if (FAILED(xr.d3d_device->CreateShaderResourceView(c.tex.Get(), &srv_desc, c.srv.GetAddressOf()))) {
-            c.srv.Reset();
-            c.tex.Reset();
-            return;
-        }
-        c.w = sd.Width;
-        c.h = sd.Height;
-    }
-    xr.d3d_context->CopyResource(c.tex.Get(), src);
-}
-
 void vr_set_hud_commands(void* commands) { xr.hud_commands = commands; }
 void* vr_get_hud_commands() { return xr.hud_commands; }
 
-// Wrist layout (default) vs the classic single HUD quad (head-locked or one hand, gVrHudAttach).
+// Wrist layout (default) vs the classic single head-locked HUD quad.
 static bool vr_hud_wrist_layout() {
     return CVarGetInteger("gVrHudLayout", 0) == 0;
 }
@@ -3677,17 +3820,60 @@ void vr_set_hud_world_panel(bool enabled, const float center[3], float yaw, floa
     }
 }
 
-// out = { s, ox, oy }: the interpreter writes x' = s x + ox w, y' = s y + oy w (clip space), which
-// maps the element's TV extent origin r0 to its slot A (native px, y down) at scale s:
-// X' = A + (X - r0) s with X = (ndc + 1) 160, Y = (1 - ndc) 120.
-bool vr_hud_tri(const float ndc[6], float out[3]) {
+// out = { s, ox, oy, sy }: the interpreter writes x' = s x + ox w, y' = sy y + oy w (clip space),
+// which maps the element's TV extent origin r0 to its slot A (native px, y down) at scale s:
+// X' = A + (X - r0) s with X = (ndc + 1) 160, Y = (1 - ndc) 120. sy = s except on the pause frame.
+bool vr_hud_tri(const float ndc[6], float out[4]) {
     const int el = xr.hud_el;
-    out[0] = 1.0f;
+    out[0] = out[3] = 1.0f;
     out[1] = out[2] = 0.0f;
     if (xr.hud_world_pass) {
-        // The pause frame: every HUD element at its TV position (vitals, buttons with Return /
-        // Save / Decide, the equip fly-in). Nothing measured: the wrists keep their layout.
-        return el != VR_HUD_EL_NONE && el != VR_HUD_EL_OTHER;
+        // The pause frame: every HUD element (vitals, buttons with Return / Save / Decide, the
+        // equip fly-in), measured only to know which corner it belongs to; the wrists keep their
+        // layout. The canvas can be wider / taller than the TV frame and the elements bigger or
+        // smaller (vr_hud_world_canvas): each element keeps its distance from its own corner
+        // (scaled with the element size), so it neither stretches nor drifts off that corner.
+        if (el == VR_HUD_EL_NONE || el == VR_HUD_EL_OTHER) {
+            return false;
+        }
+        float cx = 0.0f, cy = 0.0f;
+        float* m = xr.hud_world_meas[el];
+        for (int i = 0; i < 3; i++) {
+            const float x = ndc[i * 2], y = ndc[i * 2 + 1];
+            cx += x / 3.0f;
+            cy += y / 3.0f;
+            if (!xr.hud_world_meas_any[el]) {
+                m[0] = m[2] = x;
+                m[1] = m[3] = y;
+                xr.hud_world_meas_any[el] = true;
+            } else {
+                m[0] = std::min(m[0], x);
+                m[1] = std::min(m[1], y);
+                m[2] = std::max(m[2], x);
+                m[3] = std::max(m[3], y);
+            }
+        }
+        // The button cluster (B, A, START, the C buttons) is one group on the TV: pinned together to
+        // the top right, B / A / START keep their place just left of the C buttons. By centre alone
+        // they sat left of the middle and went to the top left, onto the hearts and magic.
+        const bool buttonCluster = el == VR_HUD_EL_BTN_A || el == VR_HUD_EL_BTN_B || el == VR_HUD_EL_BTN_START ||
+                                   (el >= VR_HUD_EL_BTN_C_LEFT && el <= VR_HUD_EL_BTN_C_UP);
+        float ax, ay;
+        if (el == VR_HUD_EL_PAUSE_FX || buttonCluster) {
+            ax = ay = 1.0f; // the fly-in lands on the C buttons (top right); never flips mid-flight
+        } else if (xr.hud_world_anchor_valid[el]) {
+            ax = xr.hud_world_anchor[el][0];
+            ay = xr.hud_world_anchor[el][1];
+        } else {
+            ax = cx < 0.0f ? -1.0f : 1.0f; // first pass it draws: this triangle decides
+            ay = cy < 0.0f ? -1.0f : 1.0f;
+        }
+        const float* c = xr.hud_world_canvas;
+        out[0] = c[2] / c[0];
+        out[3] = c[2] / c[1];
+        out[1] = ax * (1.0f - out[0]);
+        out[2] = ay * (1.0f - out[3]);
+        return true;
     }
     if (vr_hud_el_hand(el) < 0) {
         return false;
@@ -3720,7 +3906,7 @@ bool vr_hud_tri(const float ndc[6], float out[3]) {
     }
     const float s = xr.hud_slot[el][2];
     const float* r0 = xr.hud_rect[el];
-    out[0] = s;
+    out[0] = out[3] = s;
     out[1] = (xr.hud_slot[el][0] - r0[0] * s) / 160.0f + s - 1.0f;
     out[2] = 1.0f - s - (xr.hud_slot[el][1] - r0[1] * s) / 120.0f;
     return true;
@@ -3953,36 +4139,37 @@ void vr_begin_hud() {
     wait_info.timeout = XR_INFINITE_DURATION;
     xr_check(xrWaitSwapchainImage(sc.handle, &wait_info), "xrWaitSwapchainImage (HUD)");
 
-    ID3D11RenderTargetView* rtv = sc.rtvs[image_index].Get();
-    ID3D11DepthStencilView* dsv = sc.dsvs[image_index].Get();
-    xr.d3d_context->OMSetRenderTargets(1, &rtv, dsv);
-
-    float clear_color[] = { 0.0f, 0.0f, 0.0f, 0.0f }; // Transparent
-    xr.d3d_context->ClearRenderTargetView(rtv, clear_color);
-    xr.d3d_context->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
+    const float clear_color[4] = { 0.0f, 0.0f, 0.0f, 0.0f }; // Transparent
+    xr.gfx->BeginPass(vrgfx::Target::Hud, image_index, clear_color);
 
     // Wrist layout: paint each hand canvas's dark backing (premultiplied translucent black, faded
     // with its elements) over the laid-out block BEFORE the elements draw into their slots on it.
     xr.hud_world_pass = xr.hud_world;
     g_vr_hud_layout_pass = xr.hud_world_pass || vr_hud_wrist_layout();
     xr.hud_el = VR_HUD_EL_NONE;
+    if (xr.hud_world_pass) {
+        vr_hud_world_canvas(xr.hud_world_canvas);
+        for (int el = 0; el < VR_HUD_EL_COUNT; el++) {
+            xr.hud_world_meas_any[el] = false;
+        }
+    }
     if (g_vr_hud_layout_pass && !xr.hud_world_pass) {
         const int child = vr_hud_profile();
         const float sx = sc.width / 320.0f, sy = sc.height / 240.0f;
         for (int hand = 0; hand < 2; hand++) {
             const float backing = std::clamp(
                 vr_hud_panel_f(child, hand, "Backing", kVrHudPanelDefaults[child][hand].backing) / 100.0f, 0.0f, 1.0f);
-            if (!xr.d3d_context1 || !xr.hud_block_valid[hand] || backing <= 0.0f) {
+            if (!xr.hud_block_valid[hand] || backing <= 0.0f) {
                 continue;
             }
             const float* b = xr.hud_block[hand];
-            const D3D11_RECT rect = { (LONG)(b[0] * sx), (LONG)(b[1] * sy), (LONG)(b[2] * sx + 0.5f),
-                                      (LONG)(b[3] * sy + 0.5f) };
+            const int32_t x0 = (int32_t)(b[0] * sx), y0 = (int32_t)(b[1] * sy);
+            const vrgfx::Rect rect = { x0, y0, (int32_t)(b[2] * sx + 0.5f) - x0, (int32_t)(b[3] * sy + 0.5f) - y0 };
             // In-headset editing: tint the card while a hand is in reach (blue) / holding it.
             const float a = std::max(backing * xr.hud_block_alpha[hand], xr.grab.hover[hand] ? 0.6f : 0.0f);
             const float tint = xr.grab.hover[hand] == 2 ? 0.35f : (xr.grab.hover[hand] == 1 ? 0.18f : 0.0f);
             const float dark[4] = { 0.0f, tint * 0.4f * a, tint * a, a };
-            xr.d3d_context1->ClearView(rtv, dark, &rect, 1);
+            xr.gfx->ClearColorRects(vrgfx::Target::Hud, image_index, &rect, 1, dark);
         }
         for (int el = 0; el < VR_HUD_EL_COUNT; el++) {
             xr.hud_meas_any[el] = false;
@@ -3990,14 +4177,6 @@ void vr_begin_hud() {
         }
     }
 
-    D3D11_VIEWPORT viewport = {};
-    viewport.Width = static_cast<float>(sc.width);
-    viewport.Height = static_cast<float>(sc.height);
-    viewport.MinDepth = 0.0f;
-    viewport.MaxDepth = 1.0f;
-    xr.d3d_context->RSSetViewports(1, &viewport);
-
-    gfx_d3d11_set_render_target_height(sc.height);
     vr_apply_dimensions(sc.width, sc.height);
 }
 
@@ -4008,11 +4187,24 @@ void vr_end_hud() {
         g_vr_hud_layout_pass = false;
         if (!xr.hud_world_pass) {
             vr_hud_latch_and_layout();
+        } else {
+            // Each element's corner for the next pass, from the centre of where it drew on the TV
+            // frame this pass (an element that didn't draw keeps its last corner).
+            for (int el = 0; el < VR_HUD_EL_COUNT; el++) {
+                if (xr.hud_world_meas_any[el]) {
+                    const float* m = xr.hud_world_meas[el];
+                    xr.hud_world_anchor[el][0] = (m[0] + m[2]) < 0.0f ? -1.0f : 1.0f;
+                    xr.hud_world_anchor[el][1] = (m[1] + m[3]) < 0.0f ? -1.0f : 1.0f;
+                    xr.hud_world_anchor_valid[el] = true;
+                }
+            }
         }
     }
     xr.hud_world_pass = false;
 
-    vr_copy_layer_image(0, xr.hud_swapchain.images[xr.hud_image_index].texture); // desktop mirror
+    vr_draw_test_card(vrgfx::Target::Hud, xr.hud_image_index, xr.hud_swapchain.width, xr.hud_swapchain.height);
+    xr.gfx->CopyToMirror(vrgfx::Target::Hud, xr.hud_image_index, vrgfx::kMirrorHud); // desktop mirror
+    xr.gfx->EndPass(vrgfx::Target::Hud, xr.hud_image_index);
 
     XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
     xr_check(xrReleaseSwapchainImage(xr.hud_swapchain.handle, &release_info), "xrReleaseSwapchainImage (HUD)");
@@ -4041,6 +4233,12 @@ void vr_set_text_commands(void* commands, const float crop[4]) {
 
 void* vr_get_text_commands() { return xr.text_commands; }
 
+void vr_set_text_panel_layout(float width_m, float distance_m, float height_m) {
+    xr.text_layout[0] = width_m;
+    xr.text_layout[1] = distance_m;
+    xr.text_layout[2] = height_m;
+}
+
 // Same 2D pass as the HUD (rendering_hud keeps the game's flat projection), into the text swapchain.
 void vr_begin_text() {
     if (!xr.initialized) return;
@@ -4058,22 +4256,8 @@ void vr_begin_text() {
     wait_info.timeout = XR_INFINITE_DURATION;
     xr_check(xrWaitSwapchainImage(sc.handle, &wait_info), "xrWaitSwapchainImage (text)");
 
-    ID3D11RenderTargetView* rtv = sc.rtvs[image_index].Get();
-    ID3D11DepthStencilView* dsv = sc.dsvs[image_index].Get();
-    xr.d3d_context->OMSetRenderTargets(1, &rtv, dsv);
-
-    float clear_color[] = { 0.0f, 0.0f, 0.0f, 0.0f }; // Transparent
-    xr.d3d_context->ClearRenderTargetView(rtv, clear_color);
-    xr.d3d_context->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
-
-    D3D11_VIEWPORT viewport = {};
-    viewport.Width = static_cast<float>(sc.width);
-    viewport.Height = static_cast<float>(sc.height);
-    viewport.MinDepth = 0.0f;
-    viewport.MaxDepth = 1.0f;
-    xr.d3d_context->RSSetViewports(1, &viewport);
-
-    gfx_d3d11_set_render_target_height(sc.height);
+    const float clear_color[4] = { 0.0f, 0.0f, 0.0f, 0.0f }; // Transparent
+    xr.gfx->BeginPass(vrgfx::Target::Text, image_index, clear_color);
     vr_apply_dimensions(sc.width, sc.height);
 }
 
@@ -4082,7 +4266,9 @@ void vr_end_text() {
     xr.rendering_hud = false;
     xr.rendering_text = false;
 
-    vr_copy_layer_image(1, xr.text_swapchain.images[xr.text_image_index].texture); // desktop mirror
+    vr_draw_test_card(vrgfx::Target::Text, xr.text_image_index, xr.text_swapchain.width, xr.text_swapchain.height);
+    xr.gfx->CopyToMirror(vrgfx::Target::Text, xr.text_image_index, vrgfx::kMirrorText); // desktop mirror
+    xr.gfx->EndPass(vrgfx::Target::Text, xr.text_image_index);
 
     XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
     xr_check(xrReleaseSwapchainImage(xr.text_swapchain.handle, &release_info), "xrReleaseSwapchainImage (text)");
@@ -4122,22 +4308,8 @@ void vr_begin_screen() {
     wait_info.timeout = XR_INFINITE_DURATION;
     xr_check(xrWaitSwapchainImage(sc.handle, &wait_info), "xrWaitSwapchainImage (screen)");
 
-    ID3D11RenderTargetView* rtv = sc.rtvs[image_index].Get();
-    ID3D11DepthStencilView* dsv = sc.dsvs[image_index].Get();
-    xr.d3d_context->OMSetRenderTargets(1, &rtv, dsv);
-
-    float clear_color[] = { 0.0f, 0.0f, 0.0f, 1.0f }; // Opaque black
-    xr.d3d_context->ClearRenderTargetView(rtv, clear_color);
-    xr.d3d_context->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
-
-    D3D11_VIEWPORT viewport = {};
-    viewport.Width = static_cast<float>(sc.width);
-    viewport.Height = static_cast<float>(sc.height);
-    viewport.MinDepth = 0.0f;
-    viewport.MaxDepth = 1.0f;
-    xr.d3d_context->RSSetViewports(1, &viewport);
-
-    gfx_d3d11_set_render_target_height(sc.height);
+    const float clear_color[4] = { 0.0f, 0.0f, 0.0f, 1.0f }; // Opaque black
+    xr.gfx->BeginPass(vrgfx::Target::Screen, image_index, clear_color);
     vr_apply_dimensions(sc.width, sc.height);
 }
 
@@ -4146,7 +4318,10 @@ void vr_end_screen() {
     xr.rendering_hud = false;
     xr.rendering_screen = false;
 
-    vr_copy_layer_image(2, xr.screen_swapchain.images[xr.screen_image_index].texture); // desktop mirror
+    vr_draw_test_card(vrgfx::Target::Screen, xr.screen_image_index, xr.screen_swapchain.width,
+                      xr.screen_swapchain.height);
+    xr.gfx->CopyToMirror(vrgfx::Target::Screen, xr.screen_image_index, vrgfx::kMirrorScreen); // desktop mirror
+    xr.gfx->EndPass(vrgfx::Target::Screen, xr.screen_image_index);
 
     XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
     xr_check(xrReleaseSwapchainImage(xr.screen_swapchain.handle, &release_info), "xrReleaseSwapchainImage (screen)");
@@ -4174,18 +4349,12 @@ void vr_get_2d_target_size(uint32_t* w, uint32_t* h) {
 // --------------------------------------------------------------------------
 
 void vr_capture_mirror() {
-    if (!xr.initialized || !xr.mirror_texture) return;
+    if (!xr.initialized || !xr.gfx) return;
+    xr.gfx->CopyToMirror(vrgfx::Target::Eye0, xr.current_image_index[0], vrgfx::kMirrorEye);
+}
 
-    auto& sc = xr.eye_swapchains[0];
-    uint32_t idx = xr.current_image_index[0];
-    if (idx >= sc.images.size()) return;
-
-    ID3D11Texture2D* src = sc.images[idx].texture;
-    if (src) {
-        // Mirror texture was created with the same format/size as the eye swapchain image, so a
-        // straight resource copy is valid (no shader blit needed).
-        xr.d3d_context->CopyResource(xr.mirror_texture.Get(), src);
-    }
+bool vr_get_mirror_flip_v() {
+    return xr.gfx && xr.gfx->MirrorFlipV();
 }
 
 // The headset's quad layers as the desktop mirror (the left eye) sees them: each quad as a grid of
@@ -4193,9 +4362,10 @@ void vr_capture_mirror() {
 // window can draw it in perspective over the mirror (it is a compositor layer the eye image never
 // contains). Projected through the pose + FOV the mirrored eye image was rendered with.
 int vr_get_mirror_quads(VrMirrorQuad* out, int max) {
-    if (!xr.initialized || !xr.enabled) {
+    if (!xr.initialized || !xr.enabled || !xr.gfx) {
         return 0;
     }
+    const bool flip_v = xr.gfx->MirrorFlipV();
     const XrPosef& e = xr.submit_pose[0];
     const XrFovf& f = xr.submit_fov[0];
     const glm::quat eq_inv =
@@ -4208,16 +4378,25 @@ int vr_get_mirror_quads(VrMirrorQuad* out, int max) {
     int n = 0;
     for (int i = 0; i < xr.mirror_quad_count && n < max; i++) {
         const auto& m = xr.mirror_quads[i];
-        const auto& c = xr.layer_copy[m.src];
-        if (!c.srv || c.w == 0 || c.h == 0) {
+        // src 0 HUD, 1 text, 2 flat-screen panel -> mirror slots 1..3; the copies are the size of
+        // their swapchain.
+        static const int kSlot[3] = { vrgfx::kMirrorHud, vrgfx::kMirrorText, vrgfx::kMirrorScreen };
+        const auto* src_sc = m.src == 0 ? &xr.hud_swapchain : (m.src == 1 ? &xr.text_swapchain : &xr.screen_swapchain);
+        void* tex = (m.src >= 0 && m.src < 3) ? xr.gfx->MirrorTextureId(kSlot[m.src]) : nullptr;
+        const float cw = (float)src_sc->width, ch = (float)src_sc->height;
+        if (tex == nullptr || cw <= 0.0f || ch <= 0.0f) {
             continue;
         }
         VrMirrorQuad& o = out[n++];
-        o.srv = c.srv.Get();
-        o.uv[0] = (float)m.rect.offset.x / c.w;
-        o.uv[1] = (float)m.rect.offset.y / c.h;
-        o.uv[2] = (float)(m.rect.offset.x + m.rect.extent.width) / c.w;
-        o.uv[3] = (float)(m.rect.offset.y + m.rect.extent.height) / c.h;
+        o.srv = tex;
+        o.uv[0] = (float)m.rect.offset.x / cw;
+        o.uv[1] = (float)m.rect.offset.y / ch;
+        o.uv[2] = (float)(m.rect.offset.x + m.rect.extent.width) / cw;
+        o.uv[3] = (float)(m.rect.offset.y + m.rect.extent.height) / ch;
+        if (flip_v) { // copies stored bottom-up (GL): same picture, mirrored V
+            o.uv[1] = 1.0f - o.uv[1];
+            o.uv[3] = 1.0f - o.uv[3];
+        }
         const glm::quat q(m.pose.orientation.w, m.pose.orientation.x, m.pose.orientation.y, m.pose.orientation.z);
         const glm::vec3 p(m.pose.position.x, m.pose.position.y, m.pose.position.z);
         for (int ix = 0; ix < VR_MIRROR_GRID; ix++) {
@@ -4242,12 +4421,12 @@ int vr_get_mirror_quads(VrMirrorQuad* out, int max) {
 }
 
 void* vr_get_mirror_texture_id() {
-    return xr.mirror_srv.Get();
+    return xr.gfx ? xr.gfx->MirrorTextureId(vrgfx::kMirrorEye) : nullptr;
 }
 
-#else // !ENABLE_DX11
+#else // !ENABLE_VR
 
-// Stubs for non-D3D11 builds
+// Stubs for builds without OpenXR
 Fast::Interpreter* vr_get_interpreter() { return nullptr; }
 bool vr_init() { return false; }
 void vr_apply_mode_request() {}
@@ -4260,6 +4439,7 @@ bool vr_should_render_hud() { return true; }
 bool vr_should_present_desktop() { return true; }
 void vr_report_frame_times(float, float, float, float, bool) {}
 void vr_report_game_tick_ms(float) {}
+void vr_commit_pending_snap_turn() {}
 void vr_get_frame_stats(struct VrFrameStats* out) {
     if (out != nullptr) {
         *out = {};
@@ -4310,6 +4490,7 @@ bool vr_is_hand_active(int) { return false; }
 uint16_t vr_get_controller_buttons(int) { return 0; }
 void vr_get_thumbstick(int, float* x, float* y) { *x = *y = 0.0f; }
 void vr_set_turn_suppressed(bool) {}
+void vr_set_stick_suppressed(int, bool) {}
 void vr_set_climb_view_lock(int, const float*, const float*, bool) {}
 void vr_request_face_yaw(int16_t) {}
 void vr_set_climb_view_limits(const float*, const float*, const float*) {}
@@ -4338,6 +4519,13 @@ bool vr_get_head_matrix(float out[4][4]) {
     return false;
 }
 void vr_register_head_child_matrix(const void*, const float*) {}
+bool vr_get_playspace_matrix(float out[4][4]) {
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+            out[r][c] = (r == c) ? 1.0f : 0.0f;
+    return false;
+}
+void vr_register_playspace_child_matrix(const void*, const float*) {}
 void vr_clear_hand_matrices() {}
 bool vr_lookup_hand_matrix(const void*, float out[4][4]) {
     for (int r = 0; r < 4; r++)
@@ -4359,13 +4547,14 @@ void vr_end_hud() {}
 bool vr_is_rendering_hud() { return false; }
 void vr_set_text_commands(void*, const float*) {}
 void* vr_get_text_commands() { return nullptr; }
+void vr_set_text_panel_layout(float, float, float) {}
 void vr_begin_text() {}
 void vr_end_text() {}
 bool vr_is_rendering_text() { return false; }
 bool vr_wants_coverage_blend() { return false; }
 void vr_hud_marker(uint32_t) {}
 void vr_set_hud_world_panel(bool, const float*, float, float, float) {}
-bool vr_hud_tri(const float*, float* out) { out[0] = 1.0f; out[1] = out[2] = 0.0f; return true; }
+bool vr_hud_tri(const float*, float* out) { out[0] = out[3] = 1.0f; out[1] = out[2] = 0.0f; return true; }
 void vr_set_hud_child(bool) {}
 bool vr_get_hud_child() { return false; }
 bool vr_is_rendering_screen() { return false; }
@@ -4376,6 +4565,9 @@ void vr_end_screen() {}
 void vr_get_2d_target_size(uint32_t* w, uint32_t* h) { *w = 1024; *h = 768; }
 void vr_capture_mirror() {}
 void* vr_get_mirror_texture_id() { return nullptr; }
+bool vr_get_mirror_flip_v() { return false; }
+bool vr_backend_supported(int) { return false; }
+bool vr_probe_required_adapter(int, uint64_t*) { return false; }
 int vr_get_mirror_quads(VrMirrorQuad*, int) { return 0; }
 
 #endif

@@ -1810,7 +1810,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // each one lands on the TV layout, and move + size it (x' = s x + ox w, applied to the OUTPUT
     // vertices below, so shared loaded vertices are never touched) into its slot on its hand's
     // canvas. 2D pass: w is 1 for rects and the ortho HUD view, so x/w, y/w are NDC.
-    float vrHudOffset[3] = { 1.0f, 0.0f, 0.0f };
+    float vrHudOffset[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
     if (g_vr_hud_layout_pass) {
         const float ndc[6] = { v1->x / v1->w, v1->y / v1->w, v2->x / v2->w,
                                v2->y / v2->w, v3->x / v3->w, v3->y / v3->w };
@@ -2130,7 +2130,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         }
 
         const float vx = v_arr[i]->x * vrHudOffset[0] + vrHudOffset[1] * w; // SOH [VR] wrist slot
-        const float vy = v_arr[i]->y * vrHudOffset[0] + vrHudOffset[2] * w; // (identity otherwise)
+        const float vy = v_arr[i]->y * vrHudOffset[3] + vrHudOffset[2] * w; // (identity otherwise)
         mBufVbo[mBufVboLen++] = vx;
         mBufVbo[mBufVboLen++] = clip_parameters.invertY ? -vy : vy;
         mBufVbo[mBufVboLen++] = z;

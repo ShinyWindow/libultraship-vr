@@ -418,7 +418,12 @@ void Fast3dGui::DrawGame() {
     uintptr_t fb = Ship::Context::GetRawInstance()->GetWindow()->GetGfxFrameBuffer();
     if (fb) {
         ImGui::SetCursorPos(pos);
-        ImGui::Image(reinterpret_cast<ImTextureID>(fb), size);
+        // SOH [VR] The VR mirror copy may be stored bottom-up (OpenGL leaf): flip V for it.
+        if (vr_is_initialized() && vr_get_mirror_flip_v()) {
+            ImGui::Image(reinterpret_cast<ImTextureID>(fb), size, ImVec2(0.0f, 1.0f), ImVec2(1.0f, 0.0f));
+        } else {
+            ImGui::Image(reinterpret_cast<ImTextureID>(fb), size);
+        }
 
         // SOH [VR] The game image is the left-eye mirror, which never contains the headset's quad
         // layers (HUD / wrist panels, text panel, menu panel): the runtime composites those. Draw

@@ -18,6 +18,10 @@ void VR_SetOverlayDisplayList(void* commands);
 // flat-screen contexts, where text stays in the overlay). (u0,v0)-(u1,v1) is the part of the
 // 320x240 frame the panel shows (the text box, plus the staff while the ocarina is out).
 void VR_SetTextDisplayList(void* commands, float u0, float v0, float u1, float v1);
+// Per-frame override of the text panel's size and placement (width, distance, height above the
+// eyes, metres) for a list that isn't a text box (the title screen logo); width <= 0 = the text
+// panel settings. The game sets it every frame.
+void VR_SetTextPanelLayout(float widthM, float distanceM, float heightM);
 
 // HUD elements. The game tags the overlay list with marker commands (the G_VRPHYS_MASK opcode with
 // w1 = VR_HUD_MARKER(element, alpha)); everything after a marker belongs to that element until the
@@ -72,7 +76,8 @@ void VR_SetRectWorldPanel(int32_t enabled, const float mtx[16]);
 // Bracket the game's fixed-timestep logic update so the VR performance readout can separate it
 // from render cost. Game logic runs once per 20 Hz tick on the same thread as the render passes,
 // so its cost comes straight out of that tick's render budget; seeing it split out is the whole
-// point. No-ops when VR is inactive.
+// point. No-ops when VR is inactive. VR_GameTickBegin also commits a snap turn the right stick
+// latched since the last tick, so the tick culls and records for the turned heading.
 void VR_GameTickBegin(void);
 void VR_GameTickEnd(void);
 
@@ -376,6 +381,12 @@ void     VR_RegisterHandChildMatrix(const void* mtx, int hand, const float* loca
 // VR_GetHeadMatrix = that rendered head right now (game-world, MtxF layout), for a 20 Hz fallback.
 void     VR_RegisterHeadChildMatrix(const void* mtx, const float* localMf16);
 bool     VR_GetHeadMatrix(float out[4][4]);
+// The playspace's counterpart (UI left floating in the room, the item selector compass): substituted
+// per frame with (playspace) x (localMf16), the playspace frame having its origin at the same
+// interpolated anchor the camera and hands use, so it rides locomotion exactly like the hands.
+// VR_GetPlayspaceMatrix = that frame right now (game-world, MtxF layout).
+void     VR_RegisterPlayspaceChildMatrix(const void* mtx, const float* localMf16);
+bool     VR_GetPlayspaceMatrix(float out[4][4]);
 void     VR_ClearHandMatrices(void);
 
 #ifdef __cplusplus

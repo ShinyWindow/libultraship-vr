@@ -15,6 +15,7 @@
 #include "ship/controller/controldeck/ControlDeck.h"
 #include "ship/window/FileDropMgr.h"
 #include "fast/backends/gfx_sdl.h"
+#include "fast/vr_openxr.h"
 
 #ifdef __OpenBSD__
 #include <sys/sysctl.h>
@@ -740,13 +741,21 @@ void GfxWindowBackendSDL2::SyncFramerateWithTime() const {
 void GfxWindowBackendSDL2::SwapBuffersBegin() {
     bool nextVsyncEnabled = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_VSYNC_ENABLED, 1);
 
-    if (mVsyncEnabled != nextVsyncEnabled) {
+    // SOH [VR] In VR the OpenXR compositor paces the loop via xrWaitFrame. The software frame
+    // limiter and a vsynced swap would pace it off the DESKTOP monitor's clock as well, and two
+    // unsynchronised pacers drop XR frames (see gfx_dxgi.cpp SwapBuffersBegin). Swap unthrottled
+    // while VR runs; the user's vsync setting comes back when it stops.
+    const bool xrPaced = vr_is_initialized();
+    if (mVsyncEnabled != nextVsyncEnabled || xrPaced != mXrPacedApplied) {
         mVsyncEnabled = nextVsyncEnabled;
-        SDL_GL_SetSwapInterval(mVsyncEnabled ? 1 : 0);
-        SDL_RenderSetVSync(mRenderer, mVsyncEnabled ? 1 : 0);
+        mXrPacedApplied = xrPaced;
+        SDL_GL_SetSwapInterval(mVsyncEnabled && !xrPaced ? 1 : 0);
+        SDL_RenderSetVSync(mRenderer, mVsyncEnabled && !xrPaced ? 1 : 0);
     }
 
-    SyncFramerateWithTime();
+    if (!xrPaced) {
+        SyncFramerateWithTime();
+    }
     SDL_GL_SwapWindow(mWnd);
 }
 

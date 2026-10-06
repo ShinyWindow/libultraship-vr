@@ -25,6 +25,7 @@
 #include "ship/Context.h"
 #include "ship/resource/factory/ShaderFactory.h"
 #include "fast/interpreter.h"
+#include "fast/vr_openxr.h"
 #include "ship/config/ConsoleVariable.h"
 
 namespace Fast {
@@ -700,6 +701,21 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
         }
     }
 
+    // SOH [VR] The VR HUD and text quads are cleared to transparent and composited by alpha. The
+    // normal blend func also applies SRC_ALPHA/ONE_MINUS_SRC_ALPHA to alpha, which leaves translucent
+    // draws there under-covered (the compositor adds their colour onto the world). Standard "over"
+    // on alpha makes the target premultiplied, as an XR quad layer expects. Same as
+    // gfx_direct3d11.cpp's blend_state_coverage; checked per draw (eyes and quads share programs).
+    const int8_t coverage = vr_wants_coverage_blend() ? 1 : 0;
+    if (coverage != mLastCoverageBlend) {
+        mLastCoverageBlend = coverage;
+        if (coverage) {
+            glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        } else {
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        }
+    }
+
     SetPerDrawUniforms();
 
     // printf("flushing %d tris\n", buf_vbo_num_tris);
@@ -898,7 +914,8 @@ void GfxRenderingAPIOGL::ResolveMSAAColorBuffer(int fb_id_target, int fb_id_sour
 
     glBlitFramebuffer(0, 0, fb_src.width, fb_src.height, 0, 0, fb_dst.width, fb_dst.height, GL_COLOR_BUFFER_BIT,
                       GL_NEAREST);
-    glBindFramebuffer(GL_FRAMEBUFFER, mCurrentFrameBuffer);
+    // SOH [VR] Rebind by FBO name: this passed the slot index, which bound the wrong FBO (or none).
+    glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[mCurrentFrameBuffer].fbo);
 
     if (mLastScissorEnabled != 1) {
         mLastScissorEnabled = 1;
@@ -1084,7 +1101,8 @@ GfxRenderingAPIOGL::GetPixelDepth(int fb_id, const std::set<std::pair<float, flo
         }
     }
 
-    glBindFramebuffer(GL_FRAMEBUFFER, mCurrentFrameBuffer);
+    // SOH [VR] Rebind by FBO name, not slot index (see ResolveMSAAColorBuffer).
+    glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[mCurrentFrameBuffer].fbo);
 
     return res;
 }
@@ -1104,6 +1122,28 @@ void GfxRenderingAPIOGL::SetSrgbMode() {
 
 ImTextureID GfxRenderingAPIOGL::GetTextureById(int id) {
     return reinterpret_cast<ImTextureID>(id);
+}
+
+// SOH [VR] The XR target is drawn like window fb 0 (invertY = false): GL images are bottom-up and
+// the OpenXR GL binding expects exactly that. One slot, reused for every XR image (only the FBO
+// name and size change); appended after the interpreter's framebuffers, so their ids never move.
+void GfxRenderingAPIOGL::SetExternalFramebuffer(GLuint fbo, uint32_t width, uint32_t height) {
+    if (mExternalFbSlot < 0) {
+        mExternalFbSlot = (int)mFrameBuffers.size();
+        mFrameBuffers.resize(mFrameBuffers.size() + 1);
+    }
+    FramebufferOGL& fb = mFrameBuffers[mExternalFbSlot];
+    fb.fbo = fbo;
+    fb.clrbuf = 0;
+    fb.clrbufMsaa = 0;
+    fb.rbo = 0;
+    fb.width = width;
+    fb.height = height;
+    fb.msaa_level = 1;
+    fb.has_depth_buffer = true;
+    fb.invertY = false;
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    mCurrentFrameBuffer = (size_t)mExternalFbSlot;
 }
 } // namespace Fast
 #endif

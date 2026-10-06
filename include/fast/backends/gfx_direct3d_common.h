@@ -135,6 +135,12 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
         mRenderTargetHeight = height;
     }
 
+    // SOH [VR] Which GPU the device is created on, set before Init (Fast3dWindow::Init, only when VR
+    // starts at launch): the adapter the headset runtime requires (LUID, (HighPart << 32) | LowPart,
+    // 0 = unknown), else the high-performance GPU. Neither set = the system default, as before.
+    uint64_t mPreferredAdapterLuid = 0;
+    bool mPreferHighPerformance = false;
+
   private:
     void CreateDepthStencilObjects(uint32_t width, uint32_t height, uint32_t msaa_count, ID3D11DepthStencilView** view,
                                    ID3D11ShaderResourceView** srv);

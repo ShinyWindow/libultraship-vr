@@ -106,6 +106,21 @@ void Fast3dWindow::Init() {
         Ship::Context::GetRawInstance()->GetConfig()->GetInt("Shortcuts.MouseCapture", Ship::KbScancode::LUS_KB_F2));
 
     InitWindowManager();
+#ifdef ENABLE_DX11
+    // SOH [VR] OpenXR needs the D3D11 device on the adapter the runtime names. When VR starts at
+    // launch, ask the runtime BEFORE the device exists (the probe's instance is reused by vr_init
+    // below); if the headset isn't available yet, take the high-performance GPU, which is where a
+    // headset hangs on hybrid laptops and iGPU-enabled desktops. VR off at launch: untouched.
+    if (GetWindowBackend() == WindowBackend::FAST3D_DXGI_DX11 && CVarGetInteger("gVrEnabled", 1) &&
+        vr_backend_supported(GetWindowBackend())) {
+        auto* dx = static_cast<GfxRenderingAPIDX11*>(mRenderingApi);
+        uint64_t luid = 0;
+        if (vr_probe_required_adapter(GetWindowBackend(), &luid)) {
+            dx->mPreferredAdapterLuid = luid;
+        }
+        dx->mPreferHighPerformance = true;
+    }
+#endif
     mGfxDebugger = std::make_shared<GfxDebugger>();
     mInterpreter->SetGfxDebugger(mGfxDebugger);
     mInterpreter->Init(mWindowManagerApi, mRenderingApi, Ship::Context::GetRawInstance()->GetName().c_str(),
@@ -117,10 +132,11 @@ void Fast3dWindow::Init() {
     SetTextureFilter((FilteringMode)Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
         CVAR_TEXTURE_FILTER, FILTER_THREE_POINT));
 
-    // SOH [VR] Must run after Interpreter::Init — the OpenXR session binds the D3D11 device.
+    // SOH [VR] Must run after Interpreter::Init — the OpenXR session binds the renderer's device.
     // With VR mode off, skip entirely: no OpenXR session is created (and no SteamVR launch) until
-    // the player toggles VR on (vr_apply_mode_request lazily initializes).
-    if (CVarGetInteger("gVrEnabled", 1)) {
+    // the player toggles VR on (vr_apply_mode_request lazily initializes). On a renderer without
+    // VR support, skip too: vr_apply_mode_request points the saved config at one that has it.
+    if (CVarGetInteger("gVrEnabled", 1) && vr_backend_supported(GetWindowBackend())) {
         vr_init();
     }
 }

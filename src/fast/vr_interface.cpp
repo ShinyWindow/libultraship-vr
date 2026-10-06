@@ -14,6 +14,7 @@ extern "C" {
 void VR_GameTickBegin(void) {
     if (vr_is_initialized()) {
         g_game_tick_start = std::chrono::steady_clock::now();
+        vr_commit_pending_snap_turn();
     }
 }
 
@@ -62,6 +63,10 @@ void VR_SetRectWorldPanel(int32_t enabled, const float mtx[16]) {
 void VR_SetTextDisplayList(void* commands, float u0, float v0, float u1, float v1) {
     const float crop[4] = { u0, v0, u1, v1 };
     vr_set_text_commands(commands, crop);
+}
+
+void VR_SetTextPanelLayout(float widthM, float distanceM, float heightM) {
+    vr_set_text_panel_layout(widthM, distanceM, heightM);
 }
 
 void VR_SetLinkEyeHeight(float units) {
@@ -401,6 +406,14 @@ void VR_RegisterHeadChildMatrix(const void* mtx, const float* localMf16) {
 
 bool VR_GetHeadMatrix(float out[4][4]) {
     return vr_get_head_matrix(out);
+}
+
+void VR_RegisterPlayspaceChildMatrix(const void* mtx, const float* localMf16) {
+    vr_register_playspace_child_matrix(mtx, localMf16);
+}
+
+bool VR_GetPlayspaceMatrix(float out[4][4]) {
+    return vr_get_playspace_matrix(out);
 }
 
 void VR_ClearHandMatrices(void) {
