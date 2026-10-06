@@ -4,6 +4,9 @@
 #include <iostream>
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
+#ifdef __ANDROID__
+#include <spdlog/sinks/android_sink.h>
+#endif
 #include "ship/install_config.h"
 #include "ship/config/ConsoleVariable.h"
 #include "ship/controller/controldeck/ControlDeck.h"
@@ -159,7 +162,12 @@ bool Context::InitLogging(spdlog::level::level_enum debugBuildLogLevel,
         std::wcerr.clear();
         std::wcin.clear();
 #endif
+#ifdef __ANDROID__
+        // SOH [VR] stdout goes nowhere on Android: log to logcat (`adb logcat -s SoH`).
+        auto systemConsoleSink = std::make_shared<spdlog::sinks::android_sink_mt>("SoH");
+#else
         auto systemConsoleSink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
+#endif
         systemConsoleSink->set_level(spdlog::level::trace);
         sinks.push_back(systemConsoleSink);
 #endif

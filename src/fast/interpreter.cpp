@@ -70,6 +70,18 @@ std::stack<std::string> currentDir;
 
 #define TEXTURE_CACHE_MAX_SIZE 1024
 
+// SOH [VR] Android on ARM64 tags heap pointers in the top byte (hardware top-byte-ignore makes
+// them valid to dereference), so address-range sanity checks must compare the untagged value.
+// Without this the OTR path / image-signature guards below reject every heap string (garbled
+// text, missing path-referenced geometry).
+static inline uintptr_t gfx_strip_pointer_tag(uintptr_t p) {
+#if defined(__aarch64__)
+    return p & 0x00FFFFFFFFFFFFFFull;
+#else
+    return p;
+#endif
+}
+
 namespace Fast {
 
 static UcodeHandlers ucode_handler_index = ucode_f3dex2;
@@ -1965,7 +1977,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         cc_options |= SHADER_OPT(TEXEL1_BLEND);
     }
 
-    ColorCombinerKey key;
+    // Value-initialised: shader_id was left as stack garbage, so the key compared unequal at
+    // random (a combiner-map search per triangle, sometimes a duplicate combiner).
+    ColorCombinerKey key{};
     key.combine_mode = mRdp->combine_mode;
     key.options = cc_options;
 
@@ -4968,7 +4982,7 @@ static void gfx_step() {
         // Guard against null or N64-segment addresses that would crash in strlen/strncmp.
         if (opcode == OTR_G_VTX_OTR_FILEPATH || opcode == OTR_G_SETTIMG_OTR_FILEPATH ||
             opcode == OTR_G_DL_OTR_FILEPATH || opcode == OTR_G_PUSHCD || opcode == OTR_G_MTX_OTR_FILEPATH) {
-            uintptr_t w1 = (uintptr_t)cmd->words.w1;
+            uintptr_t w1 = gfx_strip_pointer_tag((uintptr_t)cmd->words.w1);
             if (w1 < 0x10000
 #if UINTPTR_MAX > 0xFFFFFFFFu
                 // On 64-bit: filter kernel/sentinel addresses.
@@ -5460,7 +5474,7 @@ void gfx_push_current_dir(char* path) {
 }
 
 int32_t gfx_check_image_signature(const char* imgData) {
-    uintptr_t i = (uintptr_t)(imgData);
+    uintptr_t i = gfx_strip_pointer_tag((uintptr_t)(imgData));
 
     if ((i & 1) == 1) {
         return 0;

@@ -8,8 +8,9 @@
 // - Depth: a private GL_DEPTH_COMPONENT32F renderbuffer per image, cleared to 1.0.
 // - The renderer caches GL state (scissor enable, blend, bound textures). Every GL call here that
 //   changes state the renderer relies on is saved and restored (StateGuard).
-// GLES (Track Q): everything outside the Win32 binding block compiles under USE_OPENGLES; see
-// markdowns/VR-GLES-DELTAS.md for what an Android/EGL build still needs.
+// GLES (Track Q, Quest standalone): the EGL binding block (VR_GL_EGL_BINDING) binds OpenXR to the
+// GLES 3 context SDL made; sRGB writes are left unencoded only where EXT_sRGB_write_control lets
+// us (markdowns/VR-GLES-DELTAS.md).
 #if defined(ENABLE_OPENGL) && defined(ENABLE_VR)
 
 #ifdef _WIN32
@@ -23,6 +24,12 @@
 #define VR_GL_WIN32_BINDING 1
 #define XR_USE_PLATFORM_WIN32
 #define XR_USE_GRAPHICS_API_OPENGL
+#elif defined(__ANDROID__) && defined(USE_OPENGLES)
+#define VR_GL_EGL_BINDING 1
+#define XR_USE_PLATFORM_ANDROID
+#define XR_USE_GRAPHICS_API_OPENGL_ES
+#include <jni.h>
+#include <EGL/egl.h>
 #endif
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
@@ -30,6 +37,7 @@
 #include <spdlog/spdlog.h>
 
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -102,25 +110,59 @@ static void ClearDepthTo1() {
 #endif
 }
 
+#ifdef USE_OPENGLES
+// GLES 3 lists extensions one by one (glGetStringi).
+static bool HasGlExtension(const char* name) {
+    GLint n = 0;
+    glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+    for (GLint i = 0; i < n; i++) {
+        const char* e = reinterpret_cast<const char*>(glGetStringi(GL_EXTENSIONS, (GLuint)i));
+        if (e != nullptr && strcmp(e, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+#endif
+
 class OpenGLBackend final : public Backend {
   public:
     explicit OpenGLBackend(Fast::GfxRenderingAPIOGL* gl) : mGl(gl) {
 #ifdef VR_GL_WIN32_BINDING
         mBinding.hDC = wglGetCurrentDC();
         mBinding.hGLRC = wglGetCurrentContext();
+#elif defined(VR_GL_EGL_BINDING)
+        mBinding.display = eglGetCurrentDisplay();
+        mBinding.context = eglGetCurrentContext();
+        // The runtime wants the context's EGLConfig; SDL doesn't expose it, the context knows its id.
+        EGLint configId = 0;
+        EGLint count = 0;
+        if (mBinding.display != EGL_NO_DISPLAY && mBinding.context != EGL_NO_CONTEXT &&
+            eglQueryContext(mBinding.display, mBinding.context, EGL_CONFIG_ID, &configId)) {
+            const EGLint attribs[] = { EGL_CONFIG_ID, configId, EGL_NONE };
+            if (!eglChooseConfig(mBinding.display, attribs, &mBinding.config, 1, &count) || count < 1) {
+                mBinding.config = nullptr;
+            }
+        }
 #endif
     }
 
     bool Valid() const {
 #ifdef VR_GL_WIN32_BINDING
         return mBinding.hDC != nullptr && mBinding.hGLRC != nullptr;
+#elif defined(VR_GL_EGL_BINDING)
+        return mBinding.display != EGL_NO_DISPLAY && mBinding.context != EGL_NO_CONTEXT && mBinding.config != nullptr;
 #else
-        return false; // no OpenXR binding for this platform yet (EGL/Xlib: Track Q / issue #31)
+        return false; // no OpenXR binding for this platform yet (Xlib: issue #31)
 #endif
     }
 
     const char* ApiName() const override {
+#ifdef USE_OPENGLES
+        return "OpenGL ES";
+#else
         return "OpenGL";
+#endif
     }
 
     const char* RequiredInstanceExtension() const override {
@@ -132,13 +174,22 @@ class OpenGLBackend final : public Backend {
     }
 
     bool CheckRequirements(XrInstance instance, XrSystemId system, std::string* why) override {
+#if defined(VR_GL_WIN32_BINDING) || defined(VR_GL_EGL_BINDING)
 #ifdef VR_GL_WIN32_BINDING
         PFN_xrGetOpenGLGraphicsRequirementsKHR getReqs = nullptr;
         xrGetInstanceProcAddr(instance, "xrGetOpenGLGraphicsRequirementsKHR",
                               reinterpret_cast<PFN_xrVoidFunction*>(&getReqs));
         XrGraphicsRequirementsOpenGLKHR reqs = { XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_KHR };
+        const char* reqsName = "xrGetOpenGLGraphicsRequirementsKHR";
+#else
+        PFN_xrGetOpenGLESGraphicsRequirementsKHR getReqs = nullptr;
+        xrGetInstanceProcAddr(instance, "xrGetOpenGLESGraphicsRequirementsKHR",
+                              reinterpret_cast<PFN_xrVoidFunction*>(&getReqs));
+        XrGraphicsRequirementsOpenGLESKHR reqs = { XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_ES_KHR };
+        const char* reqsName = "xrGetOpenGLESGraphicsRequirementsKHR";
+#endif
         if (getReqs == nullptr || XR_FAILED(getReqs(instance, system, &reqs))) {
-            *why = "xrGetOpenGLGraphicsRequirementsKHR unavailable or failed";
+            *why = std::string(reqsName) + " unavailable or failed";
             return false;
         }
         GLint major = 0, minor = 0;
@@ -159,7 +210,14 @@ class OpenGLBackend final : public Backend {
         if (reqs.maxApiVersionSupported != 0 && have > reqs.maxApiVersionSupported) {
             spdlog::warn("[VR] OpenGL {}.{} is newer than the runtime says it was tested with", major, minor);
         }
+#ifdef USE_OPENGLES
+        // Without write control a GLES sRGB surface always encodes, which would gamma the game's
+        // already-gamma output twice; then the swapchain falls back to UNORM (ChooseColorFormat).
+        mSrgbWriteControl = HasGlExtension("GL_EXT_sRGB_write_control");
+        spdlog::info("[VR] GL_EXT_sRGB_write_control: {}", mSrgbWriteControl ? "yes" : "no");
+#else
         mHasCopyImage = GLEW_VERSION_4_3 || GLEW_ARB_copy_image;
+#endif
         return true;
 #else
         (void)instance;
@@ -170,7 +228,7 @@ class OpenGLBackend final : public Backend {
     }
 
     const void* SessionBinding() override {
-#ifdef VR_GL_WIN32_BINDING
+#if defined(VR_GL_WIN32_BINDING) || defined(VR_GL_EGL_BINDING)
         return &mBinding;
 #else
         return nullptr;
@@ -180,7 +238,7 @@ class OpenGLBackend final : public Backend {
     int64_t ChooseColorFormat(const std::vector<int64_t>& formats) override {
         int64_t chosen = 0;
         for (int64_t f : formats) {
-            if (f == GL_SRGB8_ALPHA8) {
+            if (f == GL_SRGB8_ALPHA8 && mSrgbWriteControl) {
                 chosen = f;
                 break;
             }
@@ -206,7 +264,7 @@ class OpenGLBackend final : public Backend {
     }
 
     bool Attach(Target t, XrSwapchain handle, uint32_t w, uint32_t h, int64_t fmt) override {
-#ifdef VR_GL_WIN32_BINDING
+#if defined(VR_GL_WIN32_BINDING) || defined(VR_GL_EGL_BINDING)
         Detach(t);
         auto& sc = mTargets[(int)t];
         sc.width = w;
@@ -214,7 +272,11 @@ class OpenGLBackend final : public Backend {
 
         uint32_t count = 0;
         xrEnumerateSwapchainImages(handle, 0, &count, nullptr);
+#ifdef VR_GL_WIN32_BINDING
         std::vector<XrSwapchainImageOpenGLKHR> images(count, { XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR });
+#else
+        std::vector<XrSwapchainImageOpenGLESKHR> images(count, { XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR });
+#endif
         xrEnumerateSwapchainImages(handle, count, &count, reinterpret_cast<XrSwapchainImageBaseHeader*>(images.data()));
 
         StateGuard guard(true);
@@ -276,10 +338,11 @@ class OpenGLBackend final : public Backend {
         }
         // Binds the image and makes it the renderer's current framebuffer (invertY = false).
         mGl->SetExternalFramebuffer(sc.fbo[image], sc.width, sc.height);
-#ifndef USE_OPENGLES
-        // Writes to the sRGB image must not be re-encoded: the game's output is already gamma.
-        glDisable(GL_FRAMEBUFFER_SRGB);
-#endif
+        if (mSrgbWriteControl) {
+            // Writes to the sRGB image must not be re-encoded: the game's output is already gamma.
+            // (Same enum as GL_FRAMEBUFFER_SRGB_EXT on GLES.) Per pass: the state is global.
+            glDisable(GL_FRAMEBUFFER_SRGB);
+        }
         {
             StateGuard guard(false);
             glDisable(GL_SCISSOR_TEST);
@@ -386,9 +449,15 @@ class OpenGLBackend final : public Backend {
     }
 
     bool SubImageYUp() const override {
-        // Whether runtimes read GL sub-image rects bottom-left is unverified (plan §3.4): the wrist
-        // panels and text crop answer it with the test card. Dev toggle until G4 decides.
-        return CVarGetInteger("gVrGlSubImageYUp", 0) != 0;
+        // Runtimes disagree on whether GL sub-image rects are bottom-left: Meta's PC runtime (Link)
+        // reads them top-left (G4, October 5), Meta's Quest runtime bottom-left (user, October 6:
+        // the wrist panels showed an empty part of the HUD image until flipped). Dev toggle kept.
+#ifdef VR_GL_EGL_BINDING
+        constexpr int kDefault = 1;
+#else
+        constexpr int kDefault = 0;
+#endif
+        return CVarGetInteger("gVrGlSubImageYUp", kDefault) != 0;
     }
 
     void Shutdown() override {
@@ -415,6 +484,8 @@ class OpenGLBackend final : public Backend {
     static bool HasContext() {
 #ifdef VR_GL_WIN32_BINDING
         return wglGetCurrentContext() != nullptr;
+#elif defined(VR_GL_EGL_BINDING)
+        return eglGetCurrentContext() != EGL_NO_CONTEXT;
 #else
         return true;
 #endif
@@ -435,8 +506,15 @@ class OpenGLBackend final : public Backend {
     Fast::GfxRenderingAPIOGL* mGl;
 #ifdef VR_GL_WIN32_BINDING
     XrGraphicsBindingOpenGLWin32KHR mBinding = { XR_TYPE_GRAPHICS_BINDING_OPENGL_WIN32_KHR };
+#elif defined(VR_GL_EGL_BINDING)
+    XrGraphicsBindingOpenGLESAndroidKHR mBinding = { XR_TYPE_GRAPHICS_BINDING_OPENGL_ES_ANDROID_KHR };
 #endif
     bool mHasCopyImage = false;
+#ifdef USE_OPENGLES
+    bool mSrgbWriteControl = false; // set by CheckRequirements (runs before any swapchain exists)
+#else
+    bool mSrgbWriteControl = true; // desktop GL: GL_FRAMEBUFFER_SRGB is core
+#endif
     TargetImages mTargets[(int)Target::Count];
     MirrorCopy mMirror[kMirrorCount];
 };

@@ -70,8 +70,9 @@ void Gui::Init() {
     mImGuiIo->Fonts->AddFontFromMemoryCompressedBase85TTF(fontawesome_compressed_data_base85, iconFontSize,
                                                           &iconsConfig, sIconsRanges);
 
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) && !defined(ENABLE_VR)
     // Scale everything by 2 for Android
+    // (SOH [VR] not on a standalone headset: the menu panel is laid out like the PC menu.)
     ImGui::GetStyle().ScaleAllSizes(2.0f);
     mImGuiIo->FontGlobalScale = 2.0f;
 #endif

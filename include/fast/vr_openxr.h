@@ -79,6 +79,10 @@ void vr_get_recommended_resolution(uint32_t* width, uint32_t* height);
 // Headset display refresh rate in Hz (e.g. 72/90/120). Used to pace the game's fixed-timestep
 // logic via the interpolation system. Returns a sane default before the first frame is located.
 uint32_t vr_get_refresh_rate();
+// Display refresh rates the headset offers (XR_FB_display_refresh_rate: Meta's runtimes), read at
+// session start; 0 where the runtime doesn't offer a choice. gVrRefreshRate (Hz, 0 = the headset's
+// default) picks one of them.
+int vr_get_supported_refresh_rates(float* out, int max);
 float vr_get_world_scale();
 void vr_set_world_scale(float units_per_meter);
 // Link's standing eye height in game units, pushed each first-person frame. Auto world scale
@@ -205,6 +209,28 @@ void vr_set_text_panel_layout(float width_m, float distance_m, float height_m);
 void vr_begin_text();
 void vr_end_text();
 bool vr_is_rendering_text();
+
+// SoH (ImGui) menu panel. Active while the menu is visible and VR is running: ImGui then lays out
+// for a panel of vr_menu_panel_size() px (Fast3dGui) and draws each frame between vr_begin_menu()
+// and vr_end_menu() into the panel's image, a world-locked quad in front of the player. Holding the
+// left thumbstick click (right when left-handed) toggles the menu; the game sees neutral controller input while it is open.
+// The pointer is a controller ray: x, y in panel px (valid = the ray hits the panel), down = the
+// trigger (with hysteresis), wheel = ImGui wheel units accumulated since the previous call.
+struct VrMenuPointer {
+    bool valid;
+    float x, y;
+    bool down;
+    float wheel;
+    int hand;
+};
+bool vr_menu_panel_active();
+// False on standalone headsets (Android): VR can't be switched off there (no flat screen exists);
+// the VR Mode checkbox and F9 are hidden / ignored, and doffing never drops to flat.
+bool vr_can_disable();
+void vr_menu_panel_size(int* w, int* h);
+void vr_menu_take_pointer(VrMenuPointer* out);
+bool vr_begin_menu();
+void vr_end_menu();
 // A 2D pass into a transparent quad target (HUD or text): the backend accumulates alpha coverage.
 bool vr_wants_coverage_blend();
 

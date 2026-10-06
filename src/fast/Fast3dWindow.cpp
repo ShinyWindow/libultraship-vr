@@ -136,7 +136,7 @@ void Fast3dWindow::Init() {
     // With VR mode off, skip entirely: no OpenXR session is created (and no SteamVR launch) until
     // the player toggles VR on (vr_apply_mode_request lazily initializes). On a renderer without
     // VR support, skip too: vr_apply_mode_request points the saved config at one that has it.
-    if (CVarGetInteger("gVrEnabled", 1) && vr_backend_supported(GetWindowBackend())) {
+    if ((CVarGetInteger("gVrEnabled", 1) || !vr_can_disable()) && vr_backend_supported(GetWindowBackend())) {
         vr_init();
     }
 }
@@ -271,6 +271,15 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
         // The companion window is a courtesy view. Presenting it every XR frame costs an ImGui
         // frame, a full-eye-resolution mirror blit and a desktop Present, all on the critical path.
         presentDesktop = (mVrFrameCounter % desktopDivisor) == 0u;
+        // The SoH menu panel's ImGui frame runs every XR frame, and on PC that frame is also the
+        // desktop's (Fast3dGuiVrMenu.cpp), so the desktop presents every frame while it is open.
+        if (vr_menu_panel_active()) {
+            presentDesktop = true;
+        }
+#ifdef __ANDROID__
+        // Standalone headset: no desktop window exists, so no mirror copy, ImGui frame or swap.
+        presentDesktop = false;
+#endif
 
         mVrFrameCounter++;
         vr_set_frame_plan(renderEyes, renderHud, presentDesktop);
@@ -279,8 +288,11 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
     auto gui = wnd->GetGui();
     // Setup mouse state manager
     wnd->GetMouseStateManager()->StartFrame();
+    // SOH [VR] An ImGui frame runs for the desktop, or for the headset's menu panel (standalone
+    // headsets: only for the panel). Latched here: the panel may open or close inside this frame.
+    const bool runGui = presentDesktop || (vr && vr_menu_panel_active());
     // Setup of the backend frames and draw initial Window and GUI menus
-    if (presentDesktop) {
+    if (runGui) {
         gui->StartDraw();
     }
     // Setup game framebuffers to match available window space
@@ -369,6 +381,9 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
     } else {
         // Companion window skipped this frame. Still kick the queued GPU work — the XR compositor
         // is the consumer now — but leave the desktop swapchain alone.
+        if (runGui) {
+            gui->EndDraw(); // the menu panel's frame (no desktop to draw it to)
+        }
         mRenderingApi->EndFrame();
     }
 

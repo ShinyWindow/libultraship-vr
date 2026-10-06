@@ -33,7 +33,10 @@ class GfxRenderingAPI;
 
 namespace vrgfx {
 
-enum class Target : int { Eye0, Eye1, Hud, Text, Screen, Count };
+// Menu = the SoH (ImGui) menu panel, drawn by the running ImGui renderer backend into the bound
+// image; Beam = the laser pointer's static gradient strip (filled once with ClearColorRects).
+// (Menu/Beam added October 6, additive: the leaves size their per-target arrays by Count.)
+enum class Target : int { Eye0, Eye1, Hud, Text, Screen, Menu, Beam, Count };
 
 // Desktop mirror slots: 0 = left eye, 1 = HUD, 2 = text panel, 3 = flat-screen panel.
 enum MirrorSlot : int { kMirrorEye = 0, kMirrorHud = 1, kMirrorText = 2, kMirrorScreen = 3, kMirrorCount = 4 };

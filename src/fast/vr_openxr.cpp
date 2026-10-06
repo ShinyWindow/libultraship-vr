@@ -26,11 +26,22 @@ float g_vr_rect_world_mtx[4][4] = {};
 #include <windows.h> // OpenXR environment diagnostics (registry, env); no graphics API here
 #endif
 #include <openxr/openxr.h>
+#ifdef __ANDROID__
+// Platform (not graphics-API) glue: the Android loader + instance need the JavaVM and activity.
+#include <jni.h>
+#include <SDL2/SDL_system.h>
+#define XR_USE_PLATFORM_ANDROID
+#include <openxr/openxr_platform.h>
+#endif
 
 #include <spdlog/spdlog.h>
 
 #include "libultraship/bridge/consolevariablebridge.h"
 #include "ship/Context.h"
+#include "ship/window/Window.h"
+#include "ship/window/MouseStateManager.h"
+#include "ship/window/gui/Gui.h"
+#include "ship/window/gui/GuiWindow.h"
 #include "fast/Fast3dWindow.h"
 #include "fast/interpreter.h"
 #include "fast/vr_physics.h"
@@ -90,6 +101,9 @@ static constexpr float kWristPack = 0.5f;
 static constexpr float kWristCanvasW = 160.0f; // native px per hand canvas
 static bool vr_wrist_panel_pose(int hand, XrPosef* pose, float* mpu, float* w_units, float* h_units);
 static void vr_hud_grab_update();
+static void vr_draw_test_card(vrgfx::Target t, uint32_t image, uint32_t w, uint32_t h);
+static void vr_refresh_rate_init();
+static bool g_refresh_rate_retried = false; // one more rate query once frames are running
 
 // --------------------------------------------------------------------------
 // Internal state
@@ -203,6 +217,7 @@ static struct {
     XrPosef grip_pose[2];
     XrPosef grip_pose_raw[2]; // untouched by snap-turn; for compositor-space quads (hand HUD)
     XrPosef aim_pose[2];
+    XrPosef aim_pose_raw[2]; // likewise: the menu laser is cast against a compositor quad
     float trigger_value[2];
     float squeeze_value[2];
     float thumbstick_x[2];
@@ -307,6 +322,15 @@ static struct {
     bool hud_ever_rendered;    // likewise for the HUD quad — its swapchain starts uninitialised
     bool screen_ever_rendered; // and for the flat-screen panel
 
+    // SoH (ImGui) menu panel and its laser pointer (see "SoH menu panel" below). The panel image is
+    // drawn by the running ImGui renderer backend (Fast3dGui) between vr_begin_menu/vr_end_menu;
+    // the beam strip is a static gradient filled once at session start.
+    struct EyeSwapchain menu_swapchain;
+    uint32_t menu_image_index;
+    bool menu_ever_rendered;
+    struct EyeSwapchain beam_swapchain;
+    bool beam_ready;
+
     // Desktop mirror: copies of the left eye and of the headset's QUAD layers (HUD / wrist panels,
     // text panel, flat-screen panel), owned by the graphics leaf (vrgfx mirror slots). A swapchain
     // image can't be read after release, so each pass copies its image while still acquired. The
@@ -337,6 +361,14 @@ static struct {
     // layer fades toward black at the compositor (XR_KHR_composition_layer_color_scale_bias) —
     // the head is never pushed back. Target set by the game per tick; smoothed per XR frame.
     bool color_scale_supported;
+    // XR_EXT_performance_settings (Meta's runtimes): CPU clock hint, gVrHighCpuClock.
+    bool perf_settings_supported;
+    int perf_cpu_level_applied; // last XrPerfSettingsLevelEXT sent, -1 = none this session
+    // XR_FB_display_refresh_rate (Meta's runtimes): the rates this headset offers, and the request
+    // last sent for gVrRefreshRate (Hz, 0 = the headset's default). -1 = none this session.
+    bool refresh_rate_supported;
+    std::vector<float> refresh_rates;
+    float refresh_rate_applied;
     float view_fade_target;
     float view_fade_current;
 
@@ -808,6 +840,7 @@ static void update_input() {
         if ((aloc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
             (aloc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
             xr.aim_pose[h] = aloc.pose;
+            xr.aim_pose_raw[h] = aloc.pose;
         }
 
         auto get_float = [&](XrAction a) -> float {
@@ -860,6 +893,308 @@ static void update_input() {
         if (get_bool(xr.thumbstick_click_action)) b |= (1 << 4); // VR_BTN_THUMBCLICK
         if (get_bool(xr.menu_action)) b |= (1 << 5);             // VR_BTN_MENU
         xr.buttons[h] = b;
+    }
+}
+
+// --------------------------------------------------------------------------
+// SoH menu panel: the ImGui settings menu in the headset, driven by a controller laser
+// --------------------------------------------------------------------------
+// While the SoH menu is visible and VR is running, ImGui lays out for this panel instead of the
+// desktop window and draws into the menu swapchain (Fast3dGui), shown as a world-locked quad put in
+// front of the gaze when the menu opens (RAW local_space metres, like every compositor quad). A
+// controller ray is the mouse: the hit is the cursor, the trigger the left button, the stick the
+// wheel; the hand whose trigger was pulled last points. The game sees neutral controller input
+// while the panel is up, and each input stays hidden after it closes until it is released, so the
+// click that closed the menu can't swing a sword.
+// HOLDING the off hand's thumbstick click (left; right when left-handed) opens and closes it. A TAP
+// keeps doing what it is bound to (START, pause, by default): the game gets that tap as a short
+// pulse when the stick is released, since at press time it can't yet be told apart from the start
+// of a hold. (The item selector's default hold is the SWORD hand's stick click: no overlap.)
+
+static constexpr uint32_t kMenuPanelW = 1600; // ImGui display size of the panel, px
+static constexpr uint32_t kMenuPanelH = 1000;
+static constexpr float kMenuHoldSec = 0.6f;
+static constexpr float kMenuTapPulseSec = 0.12f; // over two 20 Hz game ticks: padmgr can't miss it
+
+static struct {
+    bool open; // latched once per XR frame (vr_menu_update)
+    XrPosef pose;
+    float size[2]; // metres
+    // Off-hand stick click: hold = toggle, tap = pulse to the game.
+    bool btn_prev;
+    bool btn_pending;
+    double btn_down_t;
+    double pulse_until;
+    // Pointer.
+    int hand; // -1 = not chosen yet (dominant hand on open)
+    bool hit;
+    float px, py; // panel pixels
+    float hit_dist; // metres along the ray
+    bool down;
+    float wheel; // ImGui wheel units accumulated since the last vr_menu_take_pointer
+    // After closing: inputs that were held stay hidden from the game until released.
+    uint16_t latch_buttons[2];
+    bool latch_trigger[2], latch_squeeze[2], latch_stick[2];
+} g_menu = { false, {}, {}, false, false, 0.0, 0.0, -1 };
+
+static std::shared_ptr<Ship::GuiWindow> vr_menu_window() {
+    Ship::Context* ctx = Ship::Context::GetRawInstance();
+    if (ctx == nullptr || ctx->GetWindow() == nullptr || ctx->GetWindow()->GetGui() == nullptr) {
+        return nullptr;
+    }
+    return ctx->GetWindow()->GetGui()->GetMenu();
+}
+
+// Level, gaze-facing placement in front of the head (yaw only, like the flat-screen panel).
+static void vr_menu_place() {
+    const XrPosef& vp = xr.views[0].pose; // raw: the turn is applied later in vr_begin_frame
+    const glm::vec3 head(0.5f * (xr.views[0].pose.position.x + xr.views[1].pose.position.x),
+                         0.5f * (xr.views[0].pose.position.y + xr.views[1].pose.position.y),
+                         0.5f * (xr.views[0].pose.position.z + xr.views[1].pose.position.z));
+    const glm::quat ho(vp.orientation.w, vp.orientation.x, vp.orientation.y, vp.orientation.z);
+    glm::vec3 fwd = ho * glm::vec3(0.0f, 0.0f, -1.0f);
+    fwd.y = 0.0f;
+    const float len = glm::length(fwd);
+    fwd = (len > 1e-4f) ? fwd / len : glm::vec3(0.0f, 0.0f, -1.0f);
+    const float dist = std::clamp(CVarGetFloat("gVrMenuDistance", 1.0f), 0.4f, 3.0f);
+    const float width = std::clamp(CVarGetFloat("gVrMenuWidth", 1.2f), 0.4f, 3.0f);
+    const float height = std::clamp(CVarGetFloat("gVrMenuHeight", -0.1f), -1.0f, 1.0f);
+    const glm::vec3 pos = head + fwd * dist + glm::vec3(0.0f, height, 0.0f);
+    const float qyaw = atan2f(-fwd.x, -fwd.z); // the quad's front (+Z) faces back at the player
+    const glm::quat q = glm::angleAxis(qyaw, glm::vec3(0.0f, 1.0f, 0.0f));
+    g_menu.pose.position = { pos.x, pos.y, pos.z };
+    g_menu.pose.orientation = { q.x, q.y, q.z, q.w };
+    g_menu.size[0] = width;
+    g_menu.size[1] = width * (float)kMenuPanelH / (float)kMenuPanelW;
+}
+
+// The pointing hand's ray (RAW aim pose) against the panel's front face.
+static void vr_menu_cast(int hand) {
+    g_menu.hit = false;
+    if (hand < 0 || !xr.hand_active[hand]) {
+        return;
+    }
+    const XrPosef& a = xr.aim_pose_raw[hand];
+    const glm::vec3 o(a.position.x, a.position.y, a.position.z);
+    const glm::vec3 d = glm::quat(a.orientation.w, a.orientation.x, a.orientation.y, a.orientation.z) *
+                        glm::vec3(0.0f, 0.0f, -1.0f);
+    const glm::vec3 c(g_menu.pose.position.x, g_menu.pose.position.y, g_menu.pose.position.z);
+    const glm::quat pq(g_menu.pose.orientation.w, g_menu.pose.orientation.x, g_menu.pose.orientation.y,
+                       g_menu.pose.orientation.z);
+    const glm::vec3 n = pq * glm::vec3(0.0f, 0.0f, 1.0f);
+    const float denom = glm::dot(d, n);
+    if (denom > -1e-4f) {
+        return; // parallel, or pointing at the back
+    }
+    const float t = glm::dot(c - o, n) / denom;
+    if (t <= 0.0f) {
+        return;
+    }
+    const glm::vec3 local = glm::inverse(pq) * (o + d * t - c);
+    const float u = local.x / g_menu.size[0] + 0.5f;
+    const float v = 0.5f - local.y / g_menu.size[1];
+    if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f) {
+        return;
+    }
+    g_menu.hit = true;
+    g_menu.hit_dist = t;
+    g_menu.px = u * (float)kMenuPanelW;
+    g_menu.py = v * (float)kMenuPanelH;
+}
+
+// Once per XR frame, right after update_input: before anything (snap turn, the game) reads input.
+static void vr_menu_update() {
+    const double now = (double)xr.frame_state.predictedDisplayTime * 1e-9;
+    float dt = xr.frame_state.predictedDisplayPeriod > 0
+                   ? (float)((double)xr.frame_state.predictedDisplayPeriod * 1e-9)
+                   : 1.0f / (float)vr_get_refresh_rate();
+    dt = std::min(dt, 1.0f / 30.0f);
+    const std::shared_ptr<Ship::GuiWindow> menu = vr_menu_window();
+
+    // Off-hand stick click: hold toggles the panel; a tap reaches the game as a pulse on release.
+    const int mh = CVarGetInteger("gVrLeftHanded", 0) ? 1 : 0;
+    const bool btn = (xr.buttons[mh] & VR_BTN_THUMBCLICK) != 0;
+    bool toggle = false;
+    if (btn && !g_menu.btn_prev) {
+        g_menu.btn_pending = true;
+        g_menu.btn_down_t = now;
+    }
+    if (g_menu.btn_pending && btn && now - g_menu.btn_down_t >= kMenuHoldSec) {
+        g_menu.btn_pending = false;
+        toggle = true;
+    } else if (g_menu.btn_pending && !btn) {
+        g_menu.btn_pending = false;
+        if (g_menu.open) {
+            toggle = true; // a tap also closes it
+        } else {
+            g_menu.pulse_until = now + kMenuTapPulseSec;
+        }
+    }
+    g_menu.btn_prev = btn;
+    xr.buttons[mh] &= ~VR_BTN_THUMBCLICK;
+    if (now < g_menu.pulse_until) {
+        xr.buttons[mh] |= VR_BTN_THUMBCLICK;
+    }
+    if (toggle && menu != nullptr) {
+        menu->ToggleVisibility();
+        Ship::Context::GetRawInstance()->GetWindow()->GetMouseStateManager()->UpdateMouseCapture();
+        vr_trigger_haptic(mh, 0.4f, 0.0f, 30.0f);
+    }
+
+    // Open = the menu is visible (Esc on the desktop opens it too).
+    const bool was_open = g_menu.open;
+    g_menu.open = menu != nullptr && menu->IsVisible();
+    if (g_menu.open && !was_open) {
+        vr_menu_place();
+        xr.menu_ever_rendered = false; // not the last opening's image: wait for this one's first frame
+        g_menu.down = false;
+        g_menu.wheel = 0.0f;
+        g_menu.hand = CVarGetInteger("gVrLeftHanded", 0) ? 0 : 1;
+    }
+    if (!g_menu.open && was_open) {
+        for (int h = 0; h < 2; h++) {
+            g_menu.latch_buttons[h] = xr.buttons[h];
+            g_menu.latch_trigger[h] = xr.trigger_value[h] > 0.2f;
+            g_menu.latch_squeeze[h] = xr.squeeze_value[h] > 0.2f;
+            g_menu.latch_stick[h] = fabsf(xr.thumbstick_x[h]) > 0.25f || fabsf(xr.thumbstick_y[h]) > 0.25f;
+        }
+        g_menu.down = false;
+    }
+
+    if (g_menu.open) {
+        // The pointer follows the hand that pulls its trigger.
+        for (int h = 0; h < 2; h++) {
+            if (h != g_menu.hand && !g_menu.down && xr.trigger_value[h] > 0.55f && xr.hand_active[h]) {
+                g_menu.hand = h;
+            }
+        }
+        vr_menu_cast(g_menu.hand);
+        const float trig = g_menu.hand >= 0 ? xr.trigger_value[g_menu.hand] : 0.0f;
+        if (!g_menu.down && trig > 0.55f) {
+            g_menu.down = true;
+            if (g_menu.hit) {
+                vr_trigger_haptic(g_menu.hand, 0.25f, 0.0f, 15.0f);
+            }
+        } else if (g_menu.down && trig < 0.35f) {
+            g_menu.down = false;
+        }
+        // Scroll by time, not per frame: full deflection = 12 wheel units a second.
+        const float sy = g_menu.hand >= 0 ? xr.thumbstick_y[g_menu.hand] : 0.0f;
+        if (fabsf(sy) > 0.2f) {
+            g_menu.wheel += (sy > 0.0f ? 1.0f : -1.0f) * (fabsf(sy) - 0.2f) / 0.8f * 12.0f * dt;
+        }
+    }
+
+    // What the game sees.
+    for (int h = 0; h < 2; h++) {
+        if (g_menu.open) {
+            xr.buttons[h] = 0;
+            xr.trigger_value[h] = xr.squeeze_value[h] = 0.0f;
+            xr.thumbstick_x[h] = xr.thumbstick_y[h] = 0.0f;
+            continue;
+        }
+        g_menu.latch_buttons[h] &= xr.buttons[h];
+        xr.buttons[h] &= ~g_menu.latch_buttons[h];
+        if (g_menu.latch_trigger[h]) {
+            g_menu.latch_trigger[h] = xr.trigger_value[h] > 0.2f;
+            xr.trigger_value[h] = 0.0f;
+            xr.buttons[h] &= ~VR_BTN_TRIGGER;
+        }
+        if (g_menu.latch_squeeze[h]) {
+            g_menu.latch_squeeze[h] = xr.squeeze_value[h] > 0.2f;
+            xr.squeeze_value[h] = 0.0f;
+            xr.buttons[h] &= ~VR_BTN_GRIP;
+        }
+        if (g_menu.latch_stick[h]) {
+            g_menu.latch_stick[h] = fabsf(xr.thumbstick_x[h]) > 0.25f || fabsf(xr.thumbstick_y[h]) > 0.25f;
+            xr.thumbstick_x[h] = xr.thumbstick_y[h] = 0.0f;
+        }
+    }
+}
+
+// The beam strip, once per session: transparent at the top (the far end, +Y of the quad), fading in
+// toward the hand. Built from ClearColorRects (premultiplied), so every backend gets it for free.
+static void vr_menu_fill_beam() {
+    auto& sc = xr.beam_swapchain;
+    if (sc.handle == XR_NULL_HANDLE) {
+        return;
+    }
+    XrSwapchainImageAcquireInfo acquire_info = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+    uint32_t image = 0;
+    if (!xr_check(xrAcquireSwapchainImage(sc.handle, &acquire_info, &image), "xrAcquireSwapchainImage (beam)")) {
+        return;
+    }
+    XrSwapchainImageWaitInfo wait_info = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+    wait_info.timeout = XR_INFINITE_DURATION;
+    xr_check(xrWaitSwapchainImage(sc.handle, &wait_info), "xrWaitSwapchainImage (beam)");
+    const float clear[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    xr.gfx->BeginPass(vrgfx::Target::Beam, image, clear);
+    constexpr int kBands = 16;
+    for (int i = 0; i < kBands; i++) {
+        const float a = 0.85f * (float)(i + 1) / (float)kBands; // band 0 = top = far end
+        const float rgba[4] = { 0.55f * a, 0.85f * a, 1.0f * a, a };
+        const vrgfx::Rect r = { 0, (int32_t)(sc.height * i / kBands), (int32_t)sc.width,
+                                (int32_t)(sc.height / kBands) };
+        xr.gfx->ClearColorRects(vrgfx::Target::Beam, image, &r, 1, rgba);
+    }
+    xr.gfx->EndPass(vrgfx::Target::Beam, image);
+    XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+    xr.beam_ready =
+        xr_check(xrReleaseSwapchainImage(sc.handle, &release_info), "xrReleaseSwapchainImage (beam)");
+}
+
+bool vr_menu_panel_active() {
+    return xr.initialized && xr.enabled && xr.session_running && g_menu.open;
+}
+
+void vr_menu_panel_size(int* w, int* h) {
+    *w = (int)kMenuPanelW;
+    *h = (int)kMenuPanelH;
+}
+
+void vr_menu_take_pointer(VrMenuPointer* out) {
+    out->valid = g_menu.open && g_menu.hit;
+    out->x = g_menu.px;
+    out->y = g_menu.py;
+    out->down = g_menu.down;
+    out->wheel = g_menu.wheel;
+    out->hand = g_menu.hand;
+    g_menu.wheel = 0.0f;
+}
+
+// The running ImGui renderer backend draws the panel between these (Fast3dGui). The image is
+// cleared to transparent; ImGui's blending leaves premultiplied colour, which is what the
+// compositor expects. Afterwards the window framebuffer is bound again for the desktop's copy.
+bool vr_begin_menu() {
+    if (!xr.initialized || !xr.gfx || xr.menu_swapchain.handle == XR_NULL_HANDLE) {
+        return false;
+    }
+    auto& sc = xr.menu_swapchain;
+    XrSwapchainImageAcquireInfo acquire_info = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+    if (!xr_check(xrAcquireSwapchainImage(sc.handle, &acquire_info, &xr.menu_image_index),
+                  "xrAcquireSwapchainImage (menu)")) {
+        return false;
+    }
+    XrSwapchainImageWaitInfo wait_info = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+    wait_info.timeout = XR_INFINITE_DURATION;
+    xr_check(xrWaitSwapchainImage(sc.handle, &wait_info), "xrWaitSwapchainImage (menu)");
+    const float clear[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    xr.gfx->BeginPass(vrgfx::Target::Menu, xr.menu_image_index, clear);
+    return true;
+}
+
+void vr_end_menu() {
+    if (!xr.initialized || !xr.gfx) {
+        return;
+    }
+    vr_draw_test_card(vrgfx::Target::Menu, xr.menu_image_index, xr.menu_swapchain.width, xr.menu_swapchain.height);
+    xr.gfx->EndPass(vrgfx::Target::Menu, xr.menu_image_index);
+    XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+    if (xr_check(xrReleaseSwapchainImage(xr.menu_swapchain.handle, &release_info), "xrReleaseSwapchainImage (menu)")) {
+        xr.menu_ever_rendered = true;
+    }
+    if (Fast::Interpreter* interp = vr_get_interpreter()) {
+        interp->GetCurrentRenderingAPI()->StartDrawToFramebuffer(0, 0.0f);
     }
 }
 
@@ -1064,6 +1399,7 @@ static bool vr_pending_heading_yaw(int16_t* out) {
 // the loader is pointed at, and which API layers it injects into every OpenXR app. All of it goes
 // to the log, so one log file from a player identifies their setup.
 
+#ifdef _WIN32
 static std::string vr_narrow(const wchar_t* w) {
     if (w == nullptr || *w == L'\0') {
         return std::string();
@@ -1121,6 +1457,12 @@ static int vr_log_implicit_layers(HKEY root, const char* root_name) {
     RegCloseKey(key);
     return count;
 }
+#else
+// Android: the loader asks the system runtime broker (Meta Horizon OS); there is no registry.
+static std::string vr_active_runtime_path() {
+    return "the system runtime";
+}
+#endif
 
 // Before xrCreateInstance: where the loader will go, and what it will load on the way. Once per
 // active runtime, not on every reconnect attempt.
@@ -1132,12 +1474,14 @@ static void vr_log_openxr_environment() {
     }
     s_logged_runtime = runtime;
     spdlog::info("[VR] OpenXR active runtime: {}", runtime);
+#ifdef _WIN32
     spdlog::info("[VR] OpenXR implicit API layers (loaded into every OpenXR app while enabled):");
     const int implicit = vr_log_implicit_layers(HKEY_LOCAL_MACHINE, "machine") +
                          vr_log_implicit_layers(HKEY_CURRENT_USER, "user");
     if (implicit == 0) {
         spdlog::info("[VR]   (none)");
     }
+#endif
     uint32_t n = 0;
     if (XR_SUCCEEDED(xrEnumerateApiLayerProperties(0, &n, nullptr)) && n > 0) {
         std::vector<XrApiLayerProperties> layers(n, { XR_TYPE_API_LAYER_PROPERTIES });
@@ -1251,14 +1595,63 @@ bool vr_init() {
     return true;
 }
 
+#ifdef __ANDROID__
+// Chained into XrInstanceCreateInfo (XR_KHR_android_create_instance). The activity is a global
+// ref held for the process: the runtime keeps using it for the instance's lifetime.
+static XrInstanceCreateInfoAndroidKHR s_android_instance_ci = { XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR };
+
+// XR_KHR_loader_init_android: the Android loader can't find the runtime until it has the JavaVM
+// and an application context, so this runs before the first OpenXR call (extension enumeration).
+static bool vr_android_loader_init() {
+    static bool s_done = false;
+    if (s_done) {
+        return true;
+    }
+    JNIEnv* env = static_cast<JNIEnv*>(SDL_AndroidGetJNIEnv());
+    jobject activity = static_cast<jobject>(SDL_AndroidGetActivity());
+    JavaVM* vm = nullptr;
+    if (env == nullptr || activity == nullptr || env->GetJavaVM(&vm) != JNI_OK || vm == nullptr) {
+        spdlog::error("[VR] No JavaVM / activity for the OpenXR loader");
+        return false;
+    }
+    jobject activity_ref = env->NewGlobalRef(activity);
+    env->DeleteLocalRef(activity);
+
+    PFN_xrInitializeLoaderKHR init_loader = nullptr;
+    if (XR_FAILED(xrGetInstanceProcAddr(XR_NULL_HANDLE, "xrInitializeLoaderKHR",
+                                        reinterpret_cast<PFN_xrVoidFunction*>(&init_loader))) ||
+        init_loader == nullptr) {
+        spdlog::error("[VR] The OpenXR loader has no xrInitializeLoaderKHR");
+        return false;
+    }
+    XrLoaderInitInfoAndroidKHR li = { XR_TYPE_LOADER_INIT_INFO_ANDROID_KHR };
+    li.applicationVM = vm;
+    li.applicationContext = activity_ref;
+    if (!xr_check(init_loader(reinterpret_cast<const XrLoaderInitInfoBaseHeaderKHR*>(&li)), "xrInitializeLoaderKHR")) {
+        return false;
+    }
+    s_android_instance_ci.applicationVM = vm;
+    s_android_instance_ci.applicationActivity = activity_ref;
+    s_done = true;
+    return true;
+}
+#endif
+
 // Create xr.instance with the renderer API's extension (+ the backend's extras) and the optional
 // extensions the runtime offers. Shared by vr_instance_init and the pre-device adapter probe.
 static bool vr_create_instance(const char* required_ext, const char* api_name, const std::vector<const char*>& extra) {
+#ifdef __ANDROID__
+    if (!vr_android_loader_init()) {
+        return false;
+    }
+#endif
     // Optional extensions are enabled only when the runtime offers them; the backend's graphics
     // extension is required, and checked rather than assumed.
     vr_log_openxr_environment();
     xr.user_presence_supported = false;
     xr.color_scale_supported = false;
+    xr.perf_settings_supported = false;
+    xr.refresh_rate_supported = false;
     {
         bool required_offered = false;
         uint32_t ext_count = 0;
@@ -1271,6 +1664,12 @@ static bool vr_create_instance(const char* required_ext, const char* api_name, c
             }
             if (strcmp(p.extensionName, XR_KHR_COMPOSITION_LAYER_COLOR_SCALE_BIAS_EXTENSION_NAME) == 0) {
                 xr.color_scale_supported = true;
+            }
+            if (strcmp(p.extensionName, XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME) == 0) {
+                xr.perf_settings_supported = true;
+            }
+            if (strcmp(p.extensionName, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME) == 0) {
+                xr.refresh_rate_supported = true;
             }
             if (strcmp(p.extensionName, required_ext) == 0) {
                 required_offered = true;
@@ -1291,8 +1690,20 @@ static bool vr_create_instance(const char* required_ext, const char* api_name, c
     if (xr.color_scale_supported) {
         extensions.push_back(XR_KHR_COMPOSITION_LAYER_COLOR_SCALE_BIAS_EXTENSION_NAME);
     }
+    if (xr.perf_settings_supported) {
+        extensions.push_back(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME);
+    }
+    if (xr.refresh_rate_supported) {
+        extensions.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+    }
+#ifdef __ANDROID__
+    extensions.push_back(XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME);
+#endif
 
     XrInstanceCreateInfo instance_ci = { XR_TYPE_INSTANCE_CREATE_INFO };
+#ifdef __ANDROID__
+    instance_ci.next = &s_android_instance_ci;
+#endif
     strcpy(instance_ci.applicationInfo.applicationName, "Ship of Harkinian VR");
     instance_ci.applicationInfo.applicationVersion = 1;
     strcpy(instance_ci.applicationInfo.engineName, "libultraship");
@@ -1551,16 +1962,23 @@ static bool vr_session_init() {
     // imageRect to the text box. Higher resolution than the HUD: this one is read word by word.
     if (!vr_create_swapchain(vrgfx::Target::Hud, xr.hud_swapchain, 2048, 1536, chosen_format, "HUD") ||
         !vr_create_swapchain(vrgfx::Target::Screen, xr.screen_swapchain, 1280, 960, chosen_format, "screen") ||
-        !vr_create_swapchain(vrgfx::Target::Text, xr.text_swapchain, 1280, 960, chosen_format, "text")) {
+        !vr_create_swapchain(vrgfx::Target::Text, xr.text_swapchain, 1280, 960, chosen_format, "text") ||
+        !vr_create_swapchain(vrgfx::Target::Menu, xr.menu_swapchain, kMenuPanelW, kMenuPanelH, chosen_format,
+                             "menu") ||
+        !vr_create_swapchain(vrgfx::Target::Beam, xr.beam_swapchain, 8, 256, chosen_format, "beam")) {
         vr_shutdown();
         return false;
     }
+    vr_menu_fill_beam();
 
     // Initialize views
     xr.views[0] = { XR_TYPE_VIEW };
     xr.views[1] = { XR_TYPE_VIEW };
 
     xr.grab.grabber = -1;
+    xr.perf_cpu_level_applied = -1;
+    g_refresh_rate_retried = false;
+    vr_refresh_rate_init();
     xr.initialized = true;
     xr.enabled = true;
     spdlog::info("[VR] OpenXR initialized successfully");
@@ -1578,12 +1996,15 @@ void vr_shutdown() {
         xr.gfx.reset();
     }
     for (auto* sc : { &xr.eye_swapchains[0], &xr.eye_swapchains[1], &xr.hud_swapchain, &xr.screen_swapchain,
-                      &xr.text_swapchain }) {
+                      &xr.text_swapchain, &xr.menu_swapchain, &xr.beam_swapchain }) {
         if (sc->handle != XR_NULL_HANDLE) {
             xrDestroySwapchain(sc->handle);
             sc->handle = XR_NULL_HANDLE;
         }
     }
+    xr.menu_ever_rendered = false;
+    xr.beam_ready = false;
+    xr.refresh_rates.clear();
     xr.hud_commands = nullptr;
     xr.text_commands = nullptr;
     xr.text_has_image = false;
@@ -1705,6 +2126,134 @@ static void vr_end_frame_empty() {
     xr_check(xrEndFrame(xr.session, &end_info), "xrEndFrame (no layers)");
 }
 
+// CPU clock hint (gVrHighCpuClock, default on). The game thread is CPU-bound in busy scenes (Hyrule
+// Field on a Quest 3: GPU ~25% busy while frames take 20-40 ms), and Meta's runtime raises the CPU
+// clock only after frames have already been missed (log, October 6: 1382 MHz at the start of a dip,
+// 1920 MHz a second later). Sustained high keeps it up, at some battery and heat cost; off hands the
+// choice back to the runtime (sustained low, its default). Sent only when the setting changes.
+static void vr_apply_perf_settings() {
+    if (!xr.perf_settings_supported || xr.session == XR_NULL_HANDLE) {
+        return;
+    }
+    const XrPerfSettingsLevelEXT want = CVarGetInteger("gVrHighCpuClock", 1) ? XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT
+                                                                            : XR_PERF_SETTINGS_LEVEL_SUSTAINED_LOW_EXT;
+    if ((int)want == xr.perf_cpu_level_applied) {
+        return;
+    }
+    const bool nothing_to_undo = xr.perf_cpu_level_applied < 0 && want == XR_PERF_SETTINGS_LEVEL_SUSTAINED_LOW_EXT;
+    xr.perf_cpu_level_applied = (int)want; // failed or not, don't retry every frame
+    if (nothing_to_undo) {
+        return;
+    }
+    PFN_xrPerfSettingsSetPerformanceLevelEXT set_level = nullptr;
+    xrGetInstanceProcAddr(xr.instance, "xrPerfSettingsSetPerformanceLevelEXT",
+                          reinterpret_cast<PFN_xrVoidFunction*>(&set_level));
+    if (set_level != nullptr &&
+        xr_check(set_level(xr.session, XR_PERF_SETTINGS_DOMAIN_CPU_EXT, want), "xrPerfSettingsSetPerformanceLevelEXT")) {
+        spdlog::info("[VR] CPU performance level: {}",
+                     want == XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT ? "sustained high" : "sustained low");
+    }
+}
+
+// Headset refresh rate (gVrRefreshRate, Hz; 0 = the headset's default). Meta's runtimes run an
+// immersive app at the rate it requests through XR_FB_display_refresh_rate, else their default
+// (72 Hz on Quest). The rates offered are read once per session (vr_refresh_rate_init) and logged
+// with the current one; a request is sent only when the setting changes, and only for an offered
+// rate. The game's pacing follows the real rate on its own (predictedDisplayPeriod).
+static void vr_refresh_rate_init() {
+    xr.refresh_rates.clear();
+    xr.refresh_rate_applied = -1.0f;
+    if (!xr.refresh_rate_supported) {
+        spdlog::info("[VR] Display refresh rate: the runtime offers no choice (no XR_FB_display_refresh_rate)");
+        return;
+    }
+    PFN_xrEnumerateDisplayRefreshRatesFB enumerate = nullptr;
+    PFN_xrGetDisplayRefreshRateFB get_rate = nullptr;
+    xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRefreshRatesFB",
+                          reinterpret_cast<PFN_xrVoidFunction*>(&enumerate));
+    xrGetInstanceProcAddr(xr.instance, "xrGetDisplayRefreshRateFB", reinterpret_cast<PFN_xrVoidFunction*>(&get_rate));
+    if (enumerate == nullptr) {
+        spdlog::warn("[VR] Display refresh rate: xrEnumerateDisplayRefreshRatesFB not found");
+        return;
+    }
+    uint32_t count = 0;
+    XrResult res = enumerate(xr.session, 0, &count, nullptr);
+    if (XR_FAILED(res) || count == 0) {
+        spdlog::warn("[VR] Display refresh rate: enumerating failed (XrResult {}, {} rates)", (int)res, count);
+        return;
+    }
+    xr.refresh_rates.resize(count);
+    res = enumerate(xr.session, count, &count, xr.refresh_rates.data());
+    if (XR_FAILED(res)) {
+        spdlog::warn("[VR] Display refresh rate: enumerating failed (XrResult {})", (int)res);
+        xr.refresh_rates.clear();
+        return;
+    }
+    xr.refresh_rates.resize(count);
+    std::string list;
+    for (float hz : xr.refresh_rates) {
+        list += (list.empty() ? "" : ", ") + std::to_string((int)(hz + 0.5f));
+    }
+    float current = 0.0f;
+    if (get_rate != nullptr) {
+        get_rate(xr.session, &current);
+    }
+    spdlog::info("[VR] Display refresh rates offered: {} Hz; current {:.0f} Hz", list, current);
+}
+
+static void vr_apply_refresh_rate() {
+    if (xr.refresh_rates.empty() && xr.refresh_rate_supported && !g_refresh_rate_retried) {
+        // Some runtimes only answer once the session is running.
+        g_refresh_rate_retried = true;
+        vr_refresh_rate_init();
+    }
+    if (xr.refresh_rates.empty() || xr.session == XR_NULL_HANDLE) {
+        return;
+    }
+    float want = (float)CVarGetInteger("gVrRefreshRate", 0);
+    if (want > 0.0f) {
+        // Only an offered rate (the setting may come from another headset's config).
+        bool offered = false;
+        for (float hz : xr.refresh_rates) {
+            offered |= fabsf(hz - want) < 0.5f;
+            if (fabsf(hz - want) < 0.5f) {
+                want = hz;
+            }
+        }
+        if (!offered) {
+            want = 0.0f;
+        }
+    }
+    if (want == xr.refresh_rate_applied) {
+        return;
+    }
+    const bool nothing_to_undo = xr.refresh_rate_applied < 0.0f && want == 0.0f;
+    xr.refresh_rate_applied = want; // failed or not, don't retry every frame
+    if (nothing_to_undo) {
+        return;
+    }
+    PFN_xrRequestDisplayRefreshRateFB request = nullptr;
+    xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRefreshRateFB", reinterpret_cast<PFN_xrVoidFunction*>(&request));
+    // 0 = no preference: the runtime goes back to its default.
+    if (request != nullptr && xr_check(request(xr.session, want), "xrRequestDisplayRefreshRateFB")) {
+        if (want > 0.0f) {
+            spdlog::info("[VR] Requested a {:.0f} Hz display", want);
+        } else {
+            spdlog::info("[VR] Display refresh rate back to the headset's default");
+        }
+    }
+}
+
+int vr_get_supported_refresh_rates(float* out, int max) {
+    int n = 0;
+    for (float hz : xr.refresh_rates) {
+        if (n < max) {
+            out[n++] = hz;
+        }
+    }
+    return n;
+}
+
 bool vr_begin_frame() {
     if (!xr.initialized || !xr.enabled) return false;
 
@@ -1771,6 +2320,10 @@ bool vr_begin_frame() {
 
     // Sync controllers + locate hand poses for this frame (motion controls).
     update_input();
+    // The SoH menu panel takes its pointer input first and hides it from everything after.
+    vr_menu_update();
+    vr_apply_perf_settings();
+    vr_apply_refresh_rate();
 
     // Auto world scale calibration: measure the player's physical eye height above the real floor
     // (STAGE space) and derive the scale that puts their eyes exactly at Link's eyes — which also
@@ -2565,9 +3118,58 @@ void vr_end_frame() {
     }
     xr.text_was_visible = text_visible;
 
+    // SoH menu panel, over everything (it is modal while open), and its laser beam: a thin strip
+    // from the pointing hand to the hit point (or 2.5 m out), turned about its own axis to face
+    // the head so it reads as a line from any angle.
+    XrCompositionLayerQuad menu_layer = { XR_TYPE_COMPOSITION_LAYER_QUAD };
+    XrCompositionLayerQuad beam_layer = { XR_TYPE_COMPOSITION_LAYER_QUAD };
+    const bool menu_visible = g_menu.open && xr.menu_ever_rendered;
+    bool beam_visible = false;
+    if (menu_visible) {
+        menu_layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+        menu_layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+        menu_layer.space = xr.local_space;
+        menu_layer.subImage.swapchain = xr.menu_swapchain.handle;
+        menu_layer.subImage.imageRect.offset = { 0, 0 };
+        menu_layer.subImage.imageRect.extent = { (int32_t)xr.menu_swapchain.width, (int32_t)xr.menu_swapchain.height };
+        menu_layer.pose = g_menu.pose;
+        menu_layer.size = { g_menu.size[0], g_menu.size[1] };
+
+        const int bh = g_menu.hand;
+        if (xr.beam_ready && bh >= 0 && xr.hand_active[bh] && xr.head_raw_valid) {
+            const XrPosef& a = xr.aim_pose_raw[bh];
+            const glm::vec3 o(a.position.x, a.position.y, a.position.z);
+            const glm::vec3 d = glm::normalize(
+                glm::quat(a.orientation.w, a.orientation.x, a.orientation.y, a.orientation.z) *
+                glm::vec3(0.0f, 0.0f, -1.0f));
+            const float len = g_menu.hit ? std::max(g_menu.hit_dist, 0.02f) : 2.5f;
+            const glm::vec3 mid = o + d * (0.5f * len);
+            glm::vec3 z = xr.head_pos_raw - mid;
+            z -= glm::dot(z, d) * d;
+            if (glm::length(z) < 1e-4f) {
+                z = glm::abs(d.y) < 0.9f ? glm::cross(d, glm::vec3(0.0f, 1.0f, 0.0f))
+                                         : glm::cross(d, glm::vec3(1.0f, 0.0f, 0.0f));
+            }
+            z = glm::normalize(z);
+            const glm::vec3 x = glm::cross(d, z);
+            const glm::quat q = glm::quat_cast(glm::mat3(x, d, z));
+            beam_layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            beam_layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            beam_layer.space = xr.local_space;
+            beam_layer.subImage.swapchain = xr.beam_swapchain.handle;
+            beam_layer.subImage.imageRect.offset = { 0, 0 };
+            beam_layer.subImage.imageRect.extent = { (int32_t)xr.beam_swapchain.width,
+                                                     (int32_t)xr.beam_swapchain.height };
+            beam_layer.pose.position = { mid.x, mid.y, mid.z };
+            beam_layer.pose.orientation = { q.x, q.y, q.z, q.w };
+            beam_layer.size = { 0.006f, len };
+            beam_visible = true;
+        }
+    }
+
     // Assemble layers back-to-front. The projection (world) layer is only submitted once its
     // swapchains have ever been rendered (at boot we go straight into flat-screen file select).
-    const XrCompositionLayerBaseHeader* layers[8];
+    const XrCompositionLayerBaseHeader* layers[10];
     uint32_t layer_count = 0;
     if (xr.eyes_ever_rendered) {
         layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection_layer);
@@ -2626,6 +3228,13 @@ void vr_end_frame() {
         layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&text_layer);
         mirror_rec(text_layer, 1);
     }
+    // The menu (no mirror record: the desktop draws the same ImGui frame itself), beam on top.
+    if (menu_visible) {
+        layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&menu_layer);
+    }
+    if (beam_visible) {
+        layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&beam_layer);
+    }
 
     // Sub-image rects are computed top-left (and recorded that way for the mirror above). A backend
     // whose runtime reads them bottom-left (vr_gfx.h SubImageYUp) gets them flipped here.
@@ -2638,6 +3247,8 @@ void vr_end_frame() {
             const XrSwapchain h = q->subImage.swapchain;
             const uint32_t img_h = h == xr.text_swapchain.handle     ? xr.text_swapchain.height
                                    : h == xr.screen_swapchain.handle ? xr.screen_swapchain.height
+                                   : h == xr.menu_swapchain.handle   ? xr.menu_swapchain.height
+                                   : h == xr.beam_swapchain.handle   ? xr.beam_swapchain.height
                                                                      : xr.hud_swapchain.height;
             q->subImage.imageRect.offset.y =
                 (int32_t)img_h - (q->subImage.imageRect.offset.y + q->subImage.imageRect.extent.height);
@@ -2980,7 +3591,22 @@ static void vr_release_kept_instance() {
 // Latch a pending VR<->flat mode request (CVar gVrEnabled). MUST be called at a game-tick boundary
 // only (graph.c, before the tick's display list is built): a DL built for one mode must never be
 // interpreted in the other, and toggling between xrBeginFrame/xrEndFrame would corrupt the session.
+bool vr_can_disable() {
+#ifdef __ANDROID__
+    return false; // standalone headset: there is no flat screen to fall back to
+#else
+    return true;
+#endif
+}
+
 void vr_apply_mode_request() {
+    // Standalone headsets always want VR: a saved gVrEnabled 0 (from an older build, or a config
+    // copied from a PC) is turned back on, so nothing keyed on the CVar (settings pages, the game's
+    // VR checks) believes VR is off while it runs. Off would leave nothing visible.
+    if (!vr_can_disable() && CVarGetInteger("gVrEnabled", 1) == 0) {
+        CVarSetInteger("gVrEnabled", 1);
+        CVarSave();
+    }
     const bool want = CVarGetInteger("gVrEnabled", 1) != 0;
 
     // A session the runtime lost or ended (flagged by the event pump or a *_LOST result) is torn
@@ -2991,7 +3617,7 @@ void vr_apply_mode_request() {
         spdlog::warn("[VR] OpenXR session {}: shutting it down{}", reconnect ? "lost" : "ended by the runtime",
                      reconnect ? " and reconnecting" : ", VR off");
         vr_shutdown();
-        if (reconnect) {
+        if (reconnect || !vr_can_disable()) {
             g_vr_retry.reconnect = true;
         } else {
             CVarSetInteger("gVrEnabled", 0);
@@ -3032,7 +3658,7 @@ void vr_apply_mode_request() {
                                                : "Reconnecting to the OpenXR runtime",
                              (long long)kVrRetryInterval.count(), (long long)kVrRetryWindow.count());
             }
-            if (now < g_vr_retry.deadline) {
+            if (now < g_vr_retry.deadline || !vr_can_disable()) {
                 g_vr_retry.next = now + kVrRetryInterval;
                 return;
             }
@@ -3062,7 +3688,7 @@ void vr_apply_mode_request() {
     // unforwarded proximity sensor reads "not worn" forever and would keep VR off for good.
     const bool stay_on_doff = CVarGetInteger("gVrStayOnDoff", 0) != 0;
     const bool effective = want && (xr.user_present || stay_on_doff || !xr.user_presence_supported ||
-                                    !xr.presence_confirmed);
+                                    !xr.presence_confirmed || !vr_can_disable());
 
     if (effective && !xr.enabled) {
         xr.enabled = true;
@@ -4551,6 +5177,13 @@ void vr_set_text_panel_layout(float, float, float) {}
 void vr_begin_text() {}
 void vr_end_text() {}
 bool vr_is_rendering_text() { return false; }
+bool vr_menu_panel_active() { return false; }
+bool vr_can_disable() { return true; }
+int vr_get_supported_refresh_rates(float*, int) { return 0; }
+void vr_menu_panel_size(int* w, int* h) { *w = 0; *h = 0; }
+void vr_menu_take_pointer(VrMenuPointer* out) { *out = {}; }
+bool vr_begin_menu() { return false; }
+void vr_end_menu() {}
 bool vr_wants_coverage_blend() { return false; }
 void vr_hud_marker(uint32_t) {}
 void vr_set_hud_world_panel(bool, const float*, float, float, float) {}

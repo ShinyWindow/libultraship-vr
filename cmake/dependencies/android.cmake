@@ -70,4 +70,15 @@ if (NOT ${libzip_FOUND})
     list(APPEND ADDITIONAL_LIB_INCLUDES ${libzip_SOURCE_DIR}/lib ${libzip_BINARY_DIR})
 endif()
 
+#=================== glm (header-only; the VR layer's math) ===================
+# SOH [VR] Windows gets glm from vcpkg. Fetch only (SOURCE_SUBDIR has no CMakeLists.txt).
+FetchContent_Declare(
+    glm
+    GIT_REPOSITORY https://github.com/g-truc/glm.git
+    GIT_TAG 1.0.1
+    SOURCE_SUBDIR no-cmake-project
+)
+FetchContent_MakeAvailable(glm)
+list(APPEND ADDITIONAL_LIB_INCLUDES ${glm_SOURCE_DIR})
+
 target_link_libraries(ImGui PUBLIC SDL2::SDL2)

@@ -152,6 +152,33 @@ class Fast3dGui : public Ship::Gui {
     void CalculateGameViewport() override;
     void DrawGame() override;
 
+    // SOH [VR] The SoH menu on the headset's panel (Fast3dGuiVrMenu.cpp). A panel frame is latched
+    // at WM NewFrame (vr_menu_panel_active), so no frame mixes the panel and desktop layouts: ImGui's
+    // display is the panel, the mouse is the controller ray, and a keyboard is drawn on the panel
+    // while a text field is active. Its draw data goes to the panel first, then to the desktop.
+    void VrMenuNewFrame();
+    void VrMenuDrawKeyboard();
+    void VrMenuRenderPanel(ImDrawData* data);
+    void RenderDrawDataBackend(ImDrawData* data);
+    struct VrKeyRect {
+        ImVec2 min, max;
+        int key; // index into the keyboard's key table
+    };
+    bool mVrPanelFrame = false;
+    bool mVrPanelPrev = false;
+    bool mVrViewportsWereOn = false;
+    bool mVrPrevDown = false;
+    float mVrPointerX = -1.0f, mVrPointerY = -1.0f;
+    bool mVrPointerValid = false;
+    std::vector<VrKeyRect> mVrKeys;     // last drawn layout, hit-tested by the next frame's input
+    ImVec2 mVrKeyboardMin, mVrKeyboardMax;
+    bool mVrKeyboardShown = false;
+    bool mVrShift = false;
+    int mVrKeyHeld = -1;      // key under a held trigger (repeat for backspace / arrows)
+    double mVrKeyRepeatAt = 0.0;
+    ImGuiKey mVrKeyUp = ImGuiKey_None; // a key pressed last frame, released this frame
+    bool mVrTrickleWas = true;         // io.ConfigInputTrickleEventQueue before the panel opened
+
     /**
      * @brief Returns the ImTextureID for a texture identified by its integer ID.
      * @param id Internal texture registry ID.

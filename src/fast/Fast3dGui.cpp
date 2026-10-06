@@ -72,7 +72,11 @@ void Fast3dGui::HandleWindowEvents(Fast::WindowEvent event) {
         case WindowBackend::FAST3D_SDL_METAL:
             ImGui_ImplSDL2_ProcessEvent(static_cast<const SDL_Event*>(event.Sdl.Event));
 #if defined(__ANDROID__) || defined(__IOS__)
-            Ship::Mobile::ImGuiProcessEvent(ImGui::GetIO().WantTextInput);
+            // SOH [VR] Not in the headset: the OS keyboard can't be seen over a VR session (and takes
+            // focus); the menu panel has its own keyboard (Fast3dGuiVrMenu.cpp).
+            if (!vr_is_initialized()) {
+                Ship::Mobile::ImGuiProcessEvent(ImGui::GetIO().WantTextInput);
+            }
 #endif
             break;
 #ifdef ENABLE_DX11
@@ -236,6 +240,8 @@ void Fast3dGui::ImGuiWMNewFrame() {
         default:
             break;
     }
+    // SOH [VR] After the platform backend (which sets the display size and mouse from the window).
+    VrMenuNewFrame();
 }
 
 // Bind ImGui's SDL2 gamepad backend to the controller(s) the
@@ -249,6 +255,17 @@ void Fast3dGui::RefreshImGuiGamepads() {
 }
 
 void Fast3dGui::ImGuiRenderDrawData(ImDrawData* data) {
+    // SOH [VR] A panel frame goes to the headset's menu panel first, then (scaled) to the desktop.
+    if (mVrPanelFrame) {
+        VrMenuRenderPanel(data);
+#ifdef __ANDROID__
+        return; // no desktop window on a standalone headset
+#endif
+    }
+    RenderDrawDataBackend(data);
+}
+
+void Fast3dGui::RenderDrawDataBackend(ImDrawData* data) {
     switch (mImpl.Backend) {
 #ifdef ENABLE_OPENGL
         case WindowBackend::FAST3D_SDL_OPENGL:
@@ -462,6 +479,10 @@ void Fast3dGui::DrawGame() {
     }
 
     ImGui::End();
+
+    // SOH [VR] The panel's keyboard, over everything (foreground draw list), while a text field is
+    // active on a panel frame.
+    VrMenuDrawKeyboard();
 }
 
 void Fast3dGui::ApplyResolutionChanges() {
