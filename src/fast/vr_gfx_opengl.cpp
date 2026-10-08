@@ -50,6 +50,9 @@
 #ifndef GL_FRAMEBUFFER_SRGB
 #define GL_FRAMEBUFFER_SRGB 0x8DB9
 #endif
+#ifndef GL_MAX_VIEWS_OVR
+#define GL_MAX_VIEWS_OVR 0x9631
+#endif
 
 namespace vrgfx {
 namespace {
@@ -215,6 +218,9 @@ class OpenGLBackend final : public Backend {
         // already-gamma output twice; then the swapchain falls back to UNORM (ChooseColorFormat).
         mSrgbWriteControl = HasGlExtension("GL_EXT_sRGB_write_control");
         spdlog::info("[VR] GL_EXT_sRGB_write_control: {}", mSrgbWriteControl ? "yes" : "no");
+#ifdef VR_GL_EGL_BINDING
+        DetectMultiview();
+#endif
 #else
         mHasCopyImage = GLEW_VERSION_4_3 || GLEW_ARB_copy_image;
 #endif
@@ -283,6 +289,11 @@ class OpenGLBackend final : public Backend {
         sc.color.resize(count);
         sc.fbo.assign(count, 0);
         sc.depth.assign(count, 0);
+#ifdef VR_GL_EGL_BINDING
+        if (t == Target::EyeArray) {
+            return AttachMultiview(sc, images.data(), count);
+        }
+#endif
         for (uint32_t i = 0; i < count; i++) {
             sc.color[i] = images[i].image;
             glGenRenderbuffers(1, &sc.depth[i]);
@@ -324,9 +335,22 @@ class OpenGLBackend final : public Backend {
                     glDeleteRenderbuffers(1, &r);
                 }
             }
+            for (GLuint d : sc.depthTex) {
+                if (d != 0) {
+                    glDeleteTextures(1, &d);
+                }
+            }
+            for (GLuint f : sc.layer0Fbo) {
+                if (f != 0) {
+                    glDeleteFramebuffers(1, &f);
+                }
+            }
         }
         sc.fbo.clear();
         sc.depth.clear();
+        sc.depthTex.clear();
+        sc.layer0Fbo.clear();
+        sc.multiview = false;
         sc.color.clear(); // owned by the runtime
         sc.width = sc.height = 0;
     }
@@ -337,7 +361,7 @@ class OpenGLBackend final : public Backend {
             return;
         }
         // Binds the image and makes it the renderer's current framebuffer (invertY = false).
-        mGl->SetExternalFramebuffer(sc.fbo[image], sc.width, sc.height);
+        mGl->SetExternalFramebuffer(sc.fbo[image], sc.width, sc.height, sc.multiview);
         if (mSrgbWriteControl) {
             // Writes to the sRGB image must not be re-encoded: the game's output is already gamma.
             // (Same enum as GL_FRAMEBUFFER_SRGB_EXT on GLES.) Per pass: the state is global.
@@ -360,7 +384,7 @@ class OpenGLBackend final : public Backend {
         if (image >= sc.fbo.size()) {
             return;
         }
-        mGl->SetExternalFramebuffer(sc.fbo[image], sc.width, sc.height);
+        mGl->SetExternalFramebuffer(sc.fbo[image], sc.width, sc.height, sc.multiview);
     }
 
     void ClearDepth(Target t, uint32_t image) override {
@@ -425,17 +449,37 @@ class OpenGLBackend final : public Backend {
         }
 #endif
         // Fallback (GL < 4.3, GLES 3): blit through a mirror FBO. GL_FRAMEBUFFER_SRGB is off, so the
-        // blit doesn't convert either.
+        // blit doesn't convert either. A multiview target is read through its layer-0 (left eye) FBO.
         if (m.fbo == 0) {
             glGenFramebuffers(1, &m.fbo);
         }
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m.fbo);
         glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m.tex, 0);
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, sc.fbo[image]);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, sc.multiview ? sc.layer0Fbo[image] : sc.fbo[image]);
         glDisable(GL_SCISSOR_TEST);
         glBlitFramebuffer(0, 0, (GLint)sc.width, (GLint)sc.height, 0, 0, (GLint)sc.width, (GLint)sc.height,
                           GL_COLOR_BUFFER_BIT, GL_NEAREST);
     }
+
+#ifdef USE_OPENGLES
+    // The depth buffer is never read after a pass: telling a tiled GPU so skips writing it back to
+    // memory when the tiles resolve (a full-resolution store per eye per frame otherwise).
+    void EndPass(Target t, uint32_t image) override {
+        auto& sc = mTargets[(int)t];
+        if (image >= sc.fbo.size()) {
+            return;
+        }
+        StateGuard guard(true);
+        glBindFramebuffer(GL_FRAMEBUFFER, sc.fbo[image]);
+        const GLenum depth = GL_DEPTH_ATTACHMENT;
+        glInvalidateFramebuffer(GL_FRAMEBUFFER, 1, &depth);
+    }
+#endif
+#ifdef VR_GL_EGL_BINDING
+    bool SupportsMultiview() const override {
+        return mMultiview;
+    }
+#endif
 
     void* MirrorTextureId(int slot) override {
         if (slot < 0 || slot >= kMirrorCount || mMirror[slot].tex == 0) {
@@ -475,7 +519,73 @@ class OpenGLBackend final : public Backend {
         std::vector<GLuint> color; // runtime-owned swapchain textures
         std::vector<GLuint> fbo;
         std::vector<GLuint> depth;
+        // Multiview (Target::EyeArray): color is a 2-layer GL_TEXTURE_2D_ARRAY, depth a matching
+        // array texture (renderbuffers can't be multiview), layer0Fbo reads the left eye (mirror).
+        bool multiview = false;
+        std::vector<GLuint> depthTex;
+        std::vector<GLuint> layer0Fbo;
     };
+
+#ifdef VR_GL_EGL_BINDING
+    typedef void (*PfnFramebufferTextureMultiviewOVR)(GLenum target, GLenum attachment, GLuint texture, GLint level,
+                                                      GLint baseViewIndex, GLsizei numViews);
+
+    // Single-pass stereo needs the GL extension (FBO side, here) and a renderer that can build
+    // multiview programs (the shader side: it injects the extension it found itself).
+    void DetectMultiview() {
+        mMultiview = false;
+        const char* shaderExt = mGl->MultiviewExtension();
+        if (shaderExt == nullptr) {
+            spdlog::info("[VR] Multiview: no GL_OVR_multiview / GL_OVR_multiview2 (two passes per frame)");
+            return;
+        }
+        GLint maxViews = 0;
+        glGetIntegerv(GL_MAX_VIEWS_OVR, &maxViews);
+        mFramebufferTextureMultiview =
+            reinterpret_cast<PfnFramebufferTextureMultiviewOVR>(eglGetProcAddress("glFramebufferTextureMultiviewOVR"));
+        mMultiview = maxViews >= 2 && mFramebufferTextureMultiview != nullptr;
+        spdlog::info("[VR] Multiview: {} (max views {}, {})", mMultiview ? "available" : "unavailable", maxViews,
+                     shaderExt);
+    }
+
+    bool AttachMultiview(TargetImages& sc, const XrSwapchainImageOpenGLESKHR* images, uint32_t count) {
+        if (!mMultiview) {
+            return false;
+        }
+        GLint prevArrayTex = 0;
+        glGetIntegerv(GL_TEXTURE_BINDING_2D_ARRAY, &prevArrayTex);
+        sc.multiview = true;
+        sc.depthTex.assign(count, 0);
+        sc.layer0Fbo.assign(count, 0);
+        bool ok = true;
+        for (uint32_t i = 0; i < count && ok; i++) {
+            sc.color[i] = images[i].image;
+            glGenTextures(1, &sc.depthTex[i]);
+            glBindTexture(GL_TEXTURE_2D_ARRAY, sc.depthTex[i]);
+            glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_DEPTH_COMPONENT32F, (GLsizei)sc.width, (GLsizei)sc.height, 2);
+
+            glGenFramebuffers(1, &sc.fbo[i]);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, sc.fbo[i]);
+            mFramebufferTextureMultiview(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, sc.color[i], 0, 0, 2);
+            mFramebufferTextureMultiview(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, sc.depthTex[i], 0, 0, 2);
+            const GLenum status = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+            if (status != GL_FRAMEBUFFER_COMPLETE) {
+                spdlog::error("[VR] Multiview framebuffer for image {} incomplete (0x{:x})", i, status);
+                ok = false;
+                break;
+            }
+
+            glGenFramebuffers(1, &sc.layer0Fbo[i]);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, sc.layer0Fbo[i]);
+            glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, sc.color[i], 0, 0);
+        }
+        glBindTexture(GL_TEXTURE_2D_ARRAY, (GLuint)prevArrayTex);
+        return ok;
+    }
+
+    bool mMultiview = false;
+    PfnFramebufferTextureMultiviewOVR mFramebufferTextureMultiview = nullptr;
+#endif
     struct MirrorCopy {
         GLuint tex = 0, fbo = 0;
         uint32_t w = 0, h = 0;

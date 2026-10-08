@@ -65,6 +65,20 @@ void vr_get_frame_stats(struct VrFrameStats* out);
 void vr_begin_eye(int eye);
 void vr_end_eye(int eye);
 
+// Single-pass stereo (multiview, GLES). When vr_multiview_enabled(), the frame loop draws the eyes
+// with ONE interpreter run between vr_begin_stereo / vr_end_stereo instead of two eye passes. The
+// run sees eye kCenterEye (2): a culling camera whose view contains both eyes'; the renderer's
+// multiview programs move each vertex into each eye with vr_get_multiview_eye_matrices (two
+// row-major 4x4s, clip_eye = clip_center * M; identity while eye-welded 2D is drawn). The
+// generation changes whenever the returned matrices do.
+bool vr_multiview_enabled();
+void vr_begin_stereo();
+void vr_end_stereo();
+bool vr_is_multiview_pass();
+bool vr_multiview_eye_welded();
+void vr_set_multiview_eye_welded(bool welded);
+const float* vr_get_multiview_eye_matrices(uint32_t* generation);
+
 // Matrix queries (used by gfx_pc.cpp matrix injection)
 void vr_get_projection_matrix(int eye, float out[4][4]);
 void vr_get_view_matrix(int eye, float out[4][4]);

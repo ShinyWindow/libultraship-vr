@@ -246,7 +246,15 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
     bool renderHud = true;
     bool presentDesktop = true;
     if (vr) {
-        const uint64_t stereoDivisor = (uint64_t)std::clamp(CVarGetInteger("gVrStereoDivisor", 1), 1, 4);
+        // Standalone headsets are CPU-bound on the render (October 6 Quest log): redraw every other
+        // frame there unless the player chose otherwise. Same default in the menu slider.
+#ifdef __ANDROID__
+        constexpr int kStereoDivisorDefault = 2;
+#else
+        constexpr int kStereoDivisorDefault = 1;
+#endif
+        const uint64_t stereoDivisor =
+            (uint64_t)std::clamp(CVarGetInteger("gVrStereoDivisor", kStereoDivisorDefault), 1, 4);
         const uint64_t desktopDivisor = (uint64_t)std::clamp(CVarGetInteger("gVrDesktopViewDivisor", 4), 1, 32);
 
         // Redraw the stereo pair every Nth XR frame; the frames in between resubmit the previous
@@ -321,6 +329,11 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
                     vr_begin_screen();
                     mInterpreter->Run(commands, mtxReplacements);
                     vr_end_screen();
+                } else if (vr_multiview_enabled()) {
+                    // Single-pass stereo: one run fills both layers of the eye swapchain.
+                    vr_begin_stereo();
+                    mInterpreter->Run(commands, mtxReplacements);
+                    vr_end_stereo();
                 } else {
                     for (int eye = 0; eye < 2; eye++) {
                         vr_begin_eye(eye);

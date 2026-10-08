@@ -525,6 +525,10 @@ class Interpreter {
     float* mBufVbo; // 3 vertices in a triangle and 32 floats per vtx
     size_t mBufVboLen{};
     size_t mBufVboNumTris{};
+    // SOH [VR] The rect being drawn was mapped into the world (VR_SetRectWorldPanel), so in a
+    // multiview pass it takes the per-eye transforms like any world triangle; other rects are
+    // eye-welded (see GfxSpTri1).
+    bool mVrRectWorldMapped{};
     GfxWindowBackend* mWapi = nullptr;
     GfxRenderingAPI* mRapi = nullptr;
     std::shared_ptr<GfxDebugger> mGfxDebugger;

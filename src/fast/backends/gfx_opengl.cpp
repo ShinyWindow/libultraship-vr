@@ -5,6 +5,8 @@
 #include <stdbool.h>
 #include <stdio.h>
 
+#include <algorithm>
+#include <cstring>
 #include <map>
 #include <unordered_map>
 
@@ -57,23 +59,78 @@ static void VertexArraySetAttribs(ShaderProgram* prg) {
     }
 }
 
-void GfxRenderingAPIOGL::SetUniforms(ShaderProgram* prg) const {
-    glUniform1i(prg->frameCountLocation, mFrameCount);
-    glUniform1f(prg->noiseScaleLocation, mCurrentNoiseScale);
-}
+// Uploads only what changed since this program last drew (u belongs to the bound program).
+void GfxRenderingAPIOGL::SetDrawUniforms(OglProgramUniforms& u, bool multiview) {
+    const bool all = !u.primed;
+    u.primed = true;
 
-void GfxRenderingAPIOGL::SetPerDrawUniforms() {
-    glUniform1f(mCurrentShaderProgram->prim_depth_location, mCurrentPrimDepth);
+    if (all || u.lastFrameCount != mFrameCount) {
+        glUniform1i(u.frameCount, (GLint)mFrameCount);
+        u.lastFrameCount = mFrameCount;
+    }
+    if (all || u.lastNoiseScale != mCurrentNoiseScale) {
+        glUniform1f(u.noiseScale, mCurrentNoiseScale);
+        u.lastNoiseScale = mCurrentNoiseScale;
+    }
+    if (all || u.lastPrimDepth != mCurrentPrimDepth) {
+        glUniform1f(u.primDepth, mCurrentPrimDepth);
+        u.lastPrimDepth = mCurrentPrimDepth;
+    }
 
     if (mCurrentShaderProgram->usedTextures[0] || mCurrentShaderProgram->usedTextures[1]) {
-        GLint filtering[2] = { textures[mCurrentTextureIds[0]].filtering, textures[mCurrentTextureIds[1]].filtering };
-        glUniform1iv(mCurrentShaderProgram->texture_filtering_location, 2, filtering);
+        const TextureInfo& t0 = textures[mCurrentTextureIds[0]];
+        const TextureInfo& t1 = textures[mCurrentTextureIds[1]];
+        const GLint filtering[2] = { t0.filtering, t1.filtering };
+        const GLint width[2] = { t0.width, t1.width };
+        const GLint height[2] = { t0.height, t1.height };
+        if (all || memcmp(filtering, u.lastFiltering, sizeof(filtering)) != 0) {
+            glUniform1iv(u.textureFiltering, 2, filtering);
+            memcpy(u.lastFiltering, filtering, sizeof(filtering));
+        }
+        if (all || memcmp(width, u.lastWidth, sizeof(width)) != 0) {
+            glUniform1iv(u.textureWidth, 2, width);
+            memcpy(u.lastWidth, width, sizeof(width));
+        }
+        if (all || memcmp(height, u.lastHeight, sizeof(height)) != 0) {
+            glUniform1iv(u.textureHeight, 2, height);
+            memcpy(u.lastHeight, height, sizeof(height));
+        }
+    }
 
-        GLint width[2] = { textures[mCurrentTextureIds[0]].width, textures[mCurrentTextureIds[1]].width };
-        glUniform1iv(mCurrentShaderProgram->texture_width_location, 2, width);
+    // SOH [VR] Per-layer clip transforms (vr_get_multiview_eye_matrices): the generation changes
+    // whenever the matrices do (every rendered frame, and when a draw switches between world and
+    // eye-welded geometry).
+    if (multiview) {
+        uint32_t gen = 0;
+        const float* m = vr_get_multiview_eye_matrices(&gen);
+        if (all || gen != u.lastEyeGen) {
+            glUniformMatrix4fv(u.vrEyeMtx, 2, GL_FALSE, m);
+            u.lastEyeGen = gen;
+        }
+    }
+}
 
-        GLint height[2] = { textures[mCurrentTextureIds[0]].height, textures[mCurrentTextureIds[1]].height };
-        glUniform1iv(mCurrentShaderProgram->texture_height_location, 2, height);
+static OglProgramUniforms LocateUniforms(GLuint program) {
+    OglProgramUniforms u;
+    u.frameCount = glGetUniformLocation(program, "frame_count");
+    u.noiseScale = glGetUniformLocation(program, "noise_scale");
+    u.primDepth = glGetUniformLocation(program, "prim_depth");
+    u.textureWidth = glGetUniformLocation(program, "texture_width");
+    u.textureHeight = glGetUniformLocation(program, "texture_height");
+    u.textureFiltering = glGetUniformLocation(program, "texture_filtering");
+    u.vrEyeMtx = glGetUniformLocation(program, "uVrEyeMtx");
+    return u;
+}
+
+// Sampler units are fixed per name; set once on the (bound) program.
+static void BindSamplerUnits(GLuint program, const CCFeatures& cc_features) {
+    static const char* const kNames[6] = { "uTex0", "uTex1", "uTexMask0", "uTexMask1", "uTexBlend0", "uTexBlend1" };
+    const bool used[6] = { cc_features.usedTextures[0], cc_features.usedTextures[1], cc_features.used_masks[0],
+                           cc_features.used_masks[1],   cc_features.used_blend[0],   cc_features.used_blend[1] };
+    for (int i = 0; i < 6; i++) {
+        if (used[i]) {
+            glUniform1i(glGetUniformLocation(program, kNames[i]), i);
+        }
     }
 }
 
@@ -92,11 +149,11 @@ void GfxRenderingAPIOGL::LoadShader(ShaderProgram* new_prg) {
     // if (!new_prg) return;
     mCurrentShaderProgram = new_prg;
     if (new_prg != mLastLoadedShader) {
-        glUseProgram(new_prg->openglProgramId);
+        // Which program variant gets bound (base or multiview) depends on the target, so binding
+        // and uniforms happen at draw time. The vertex layout is the same for both.
         VertexArraySetAttribs(new_prg);
         mLastLoadedShader = new_prg;
     }
-    SetUniforms(new_prg);
 }
 
 #define RAND_NOISE "((random(vec3(floor(gl_FragCoord.xy * noise_scale), float(frame_count))) + 1.0) / 2.0)"
@@ -404,95 +461,129 @@ void GfxRenderingAPIOGL::ClearShaderCache() {
     mShaderProgramPool.clear();
 }
 
-ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, uint64_t shader_id1) {
-    CCFeatures cc_features;
-    gfx_cc_get_features(shader_id0, shader_id1, &cc_features);
-    const auto fs_buf = BuildFsShader(cc_features);
-    const auto vs_buf = BuildVsShader(cc_features);
-    const GLchar* sources[2] = { vs_buf.data(), fs_buf.data() };
-    const GLint lengths[2] = { (GLint)vs_buf.size(), (GLint)fs_buf.size() };
-    GLint success;
+// The vertex attributes a combiner's shader takes, in VBO order. Every program built for the
+// combiner binds attribute i to location i, so the base and multiview programs share one layout.
+struct AttribLayout {
+    char names[16][32];
+    uint8_t sizes[16];
+    size_t count = 0;
 
-    GLuint vertex_shader = glCreateShader(GL_VERTEX_SHADER);
-    glShaderSource(vertex_shader, 1, &sources[0], &lengths[0]);
-    glCompileShader(vertex_shader);
-    glGetShaderiv(vertex_shader, GL_COMPILE_STATUS, &success);
-    if (!success) {
-        GLint max_length = 0;
-        glGetShaderiv(vertex_shader, GL_INFO_LOG_LENGTH, &max_length);
-        char error_log[1024];
-        // fprintf(stderr, "Vertex shader compilation failed\n");
-        glGetShaderInfoLog(vertex_shader, max_length, &max_length, &error_log[0]);
-        // fprintf(stderr, "%s\n", &error_log[0]);
-        abort();
+    void Add(const char* name, uint8_t size) {
+        snprintf(names[count], sizeof(names[count]), "%s", name);
+        sizes[count] = size;
+        ++count;
     }
+};
 
-    GLuint fragment_shader = glCreateShader(GL_FRAGMENT_SHADER);
-    glShaderSource(fragment_shader, 1, &sources[1], &lengths[1]);
-    glCompileShader(fragment_shader);
-    glGetShaderiv(fragment_shader, GL_COMPILE_STATUS, &success);
+static AttribLayout BuildAttribLayout(const CCFeatures& cc_features) {
+    AttribLayout l;
+    l.Add("aVtxPos", 4);
+    for (int i = 0; i < 2; i++) {
+        if (cc_features.usedTextures[i]) {
+            char name[32];
+            snprintf(name, sizeof(name), "aTexCoord%d", i);
+            l.Add(name, 2);
+            for (int j = 0; j < 2; j++) {
+                if (cc_features.clamp[i][j]) {
+                    snprintf(name, sizeof(name), "aTexClamp%s%d", j == 0 ? "S" : "T", i);
+                    l.Add(name, 1);
+                }
+            }
+        }
+    }
+    if (cc_features.opt_fog) {
+        l.Add("aFog", 4);
+    }
+    if (cc_features.opt_grayscale) {
+        l.Add("aGrayscaleColor", 4);
+    }
+    for (int i = 0; i < cc_features.numInputs; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "aInput%d", i + 1);
+        l.Add(name, cc_features.opt_alpha ? 4 : 3);
+    }
+    return l;
+}
+
+static GLuint CompileShaderStage(GLenum stage, const std::string& src, const char* what) {
+    const GLchar* source = src.data();
+    const GLint length = (GLint)src.size();
+    GLuint shader = glCreateShader(stage);
+    glShaderSource(shader, 1, &source, &length);
+    glCompileShader(shader);
+    GLint success = 0;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
     if (!success) {
-        GLint max_length = 0;
-        glGetShaderiv(fragment_shader, GL_INFO_LOG_LENGTH, &max_length);
-        char error_log[1024];
-        fprintf(stderr, "Fragment shader compilation failed\n");
-        glGetShaderInfoLog(fragment_shader, max_length, &max_length, &error_log[0]);
-        fprintf(stderr, "%s\n", &error_log[0]);
-        abort();
+        char error_log[1024] = {};
+        GLsizei len = 0;
+        glGetShaderInfoLog(shader, sizeof(error_log) - 1, &len, error_log);
+        SPDLOG_ERROR("{} shader compilation failed: {}", what, error_log);
+        glDeleteShader(shader);
+        return 0;
+    }
+    return shader;
+}
+
+// Returns 0 when compiling or linking fails.
+GLuint GfxRenderingAPIOGL::BuildProgram(const std::string& vs, const std::string& fs, const char* const* attribNames,
+                                        size_t attribCount) {
+    const GLuint vertex_shader = CompileShaderStage(GL_VERTEX_SHADER, vs, "Vertex");
+    const GLuint fragment_shader = vertex_shader != 0 ? CompileShaderStage(GL_FRAGMENT_SHADER, fs, "Fragment") : 0;
+    if (vertex_shader == 0 || fragment_shader == 0) {
+        if (vertex_shader != 0) {
+            glDeleteShader(vertex_shader);
+        }
+        return 0;
     }
 
     GLuint shader_program = glCreateProgram();
     glAttachShader(shader_program, vertex_shader);
     glAttachShader(shader_program, fragment_shader);
+    for (size_t i = 0; i < attribCount; i++) {
+        glBindAttribLocation(shader_program, (GLuint)i, attribNames[i]);
+    }
     glLinkProgram(shader_program);
+    glDeleteShader(vertex_shader); // flagged; freed with the program
+    glDeleteShader(fragment_shader);
 
-    size_t cnt = 0;
+    GLint linked = 0;
+    glGetProgramiv(shader_program, GL_LINK_STATUS, &linked);
+    if (!linked) {
+        char error_log[1024] = {};
+        GLsizei len = 0;
+        glGetProgramInfoLog(shader_program, sizeof(error_log) - 1, &len, error_log);
+        SPDLOG_ERROR("Shader program link failed: {}", error_log);
+        glDeleteProgram(shader_program);
+        return 0;
+    }
+    return shader_program;
+}
+
+ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, uint64_t shader_id1) {
+    CCFeatures cc_features;
+    gfx_cc_get_features(shader_id0, shader_id1, &cc_features);
+    const auto fs_buf = BuildFsShader(cc_features);
+    const auto vs_buf = BuildVsShader(cc_features);
+
+    const AttribLayout layout = BuildAttribLayout(cc_features);
+    const char* attribNames[16];
+    for (size_t i = 0; i < layout.count; i++) {
+        attribNames[i] = layout.names[i];
+    }
+    const GLuint shader_program = BuildProgram(vs_buf, fs_buf, attribNames, layout.count);
+    if (shader_program == 0) {
+        abort();
+    }
 
     struct ShaderProgram* prg = &mShaderProgramPool[std::make_pair(shader_id0, shader_id1)];
-    prg->attribLocations[cnt] = glGetAttribLocation(shader_program, "aVtxPos");
-    prg->attribSizes[cnt] = 4;
-    ++cnt;
-
-    for (int i = 0; i < 2; i++) {
-        if (cc_features.usedTextures[i]) {
-            char name[32];
-            snprintf(name, sizeof(name), "aTexCoord%d", i);
-            prg->attribLocations[cnt] = glGetAttribLocation(shader_program, name);
-            prg->attribSizes[cnt] = 2;
-            ++cnt;
-
-            for (int j = 0; j < 2; j++) {
-                if (cc_features.clamp[i][j]) {
-                    snprintf(name, sizeof(name), "aTexClamp%s%d", j == 0 ? "S" : "T", i);
-                    prg->attribLocations[cnt] = glGetAttribLocation(shader_program, name);
-                    prg->attribSizes[cnt] = 1;
-                    ++cnt;
-                }
-            }
-        }
-    }
-
-    if (cc_features.opt_fog) {
-        prg->attribLocations[cnt] = glGetAttribLocation(shader_program, "aFog");
-        prg->attribSizes[cnt] = 4;
-        ++cnt;
-    }
-
-    if (cc_features.opt_grayscale) {
-        prg->attribLocations[cnt] = glGetAttribLocation(shader_program, "aGrayscaleColor");
-        prg->attribSizes[cnt] = 4;
-        ++cnt;
-    }
-
-    for (int i = 0; i < cc_features.numInputs; i++) {
-        char name[16];
-        snprintf(name, sizeof(name), "aInput%d", i + 1);
-        prg->attribLocations[cnt] = glGetAttribLocation(shader_program, name);
-        prg->attribSizes[cnt] = cc_features.opt_alpha ? 4 : 3;
-        ++cnt;
+    for (size_t i = 0; i < layout.count; i++) {
+        prg->attribLocations[i] = glGetAttribLocation(shader_program, layout.names[i]);
+        prg->attribSizes[i] = layout.sizes[i];
     }
 
     prg->openglProgramId = shader_program;
+    prg->shaderId0 = shader_id0;
+    prg->shaderId1 = shader_id1;
     prg->numInputs = cc_features.numInputs;
     prg->usedTextures[0] = cc_features.usedTextures[0];
     prg->usedTextures[1] = cc_features.usedTextures[1];
@@ -501,43 +592,77 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->usedTextures[4] = cc_features.used_blend[0];
     prg->usedTextures[5] = cc_features.used_blend[1];
     prg->numFloats = numFloats;
-    prg->numAttribs = cnt;
-
-    prg->frameCountLocation = glGetUniformLocation(shader_program, "frame_count");
-    prg->noiseScaleLocation = glGetUniformLocation(shader_program, "noise_scale");
-    prg->prim_depth_location = glGetUniformLocation(shader_program, "prim_depth");
-    prg->texture_width_location = glGetUniformLocation(shader_program, "texture_width");
-    prg->texture_height_location = glGetUniformLocation(shader_program, "texture_height");
-    prg->texture_filtering_location = glGetUniformLocation(shader_program, "texture_filtering");
+    prg->numAttribs = layout.count;
+    prg->uniforms = LocateUniforms(shader_program);
+    prg->multiviewProgramId = 0;
+    prg->multiviewTried = false;
+    prg->multiviewUniforms = {};
 
     LoadShader(prg);
 
-    if (cc_features.usedTextures[0]) {
-        GLint sampler_location = glGetUniformLocation(shader_program, "uTex0");
-        glUniform1i(sampler_location, 0);
-    }
-    if (cc_features.usedTextures[1]) {
-        GLint sampler_location = glGetUniformLocation(shader_program, "uTex1");
-        glUniform1i(sampler_location, 1);
-    }
-    if (cc_features.used_masks[0]) {
-        GLint sampler_location = glGetUniformLocation(shader_program, "uTexMask0");
-        glUniform1i(sampler_location, 2);
-    }
-    if (cc_features.used_masks[1]) {
-        GLint sampler_location = glGetUniformLocation(shader_program, "uTexMask1");
-        glUniform1i(sampler_location, 3);
-    }
-    if (cc_features.used_blend[0]) {
-        GLint sampler_location = glGetUniformLocation(shader_program, "uTexBlend0");
-        glUniform1i(sampler_location, 4);
-    }
-    if (cc_features.used_blend[1]) {
-        GLint sampler_location = glGetUniformLocation(shader_program, "uTexBlend1");
-        glUniform1i(sampler_location, 5);
-    }
+    glUseProgram(shader_program);
+    mBoundProgram = shader_program;
+    BindSamplerUnits(shader_program, cc_features);
 
     return prg;
+}
+
+// SOH [VR] Rewrites a processed vertex shader into its multiview twin: the extension and
+// layout(num_views = 2) right after #version, and gl_Position through the per-layer transform.
+// Done on the processed text rather than as a template flag so custom shaders get it too and the
+// APK's shaders don't depend on soh.o2r having been regenerated.
+static bool MakeMultiviewVertexShader(std::string& vs, const char* ext) {
+    const size_t version = vs.find("#version");
+    const size_t eol = version == std::string::npos ? std::string::npos : vs.find('\n', version);
+    const std::string from = "gl_Position = aVtxPos;";
+    const size_t pos = vs.find(from);
+    if (eol == std::string::npos || pos == std::string::npos) {
+        return false;
+    }
+    vs.replace(pos, from.size(), "gl_Position = uVrEyeMtx[int(gl_ViewID_OVR)] * aVtxPos;");
+    vs.insert(eol + 1, std::string("#extension ") + ext +
+                           " : require\nlayout(num_views = 2) in;\nuniform mat4 uVrEyeMtx[2];\n");
+    return true;
+}
+
+bool GfxRenderingAPIOGL::EnsureMultiviewProgram(ShaderProgram* prg) {
+    if (prg->multiviewProgramId != 0) {
+        return true;
+    }
+    if (prg->multiviewTried) {
+        return false;
+    }
+    prg->multiviewTried = true;
+    if (mMultiviewExt == nullptr) {
+        return false;
+    }
+
+    CCFeatures cc_features;
+    gfx_cc_get_features(prg->shaderId0, prg->shaderId1, &cc_features);
+    const auto fs_buf = BuildFsShader(cc_features);
+    auto vs_buf = BuildVsShader(cc_features);
+    if (!MakeMultiviewVertexShader(vs_buf, mMultiviewExt)) {
+        SPDLOG_ERROR("[VR] Multiview: vertex shader for combiner {:x}/{:x} has no gl_Position = aVtxPos; line",
+                     prg->shaderId0, prg->shaderId1);
+        return false;
+    }
+    const AttribLayout layout = BuildAttribLayout(cc_features);
+    const char* attribNames[16];
+    for (size_t i = 0; i < layout.count; i++) {
+        attribNames[i] = layout.names[i];
+    }
+    const GLuint program = BuildProgram(vs_buf, fs_buf, attribNames, layout.count);
+    if (program == 0) {
+        SPDLOG_ERROR("[VR] Multiview: building the program for combiner {:x}/{:x} failed", prg->shaderId0,
+                     prg->shaderId1);
+        return false;
+    }
+    prg->multiviewProgramId = program;
+    prg->multiviewUniforms = LocateUniforms(program);
+    glUseProgram(program);
+    mBoundProgram = program;
+    BindSamplerUnits(program, cc_features);
+    return true;
 }
 
 struct ShaderProgram* GfxRenderingAPIOGL::LookupShader(uint64_t shader_id0, uint64_t shader_id1) {
@@ -716,11 +841,114 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
         }
     }
 
-    SetPerDrawUniforms();
+    // SOH [VR] A two-layer XR eye target takes the combiner's multiview program; any other target
+    // (offscreen framebuffers mid-pass included) the normal one. A single-view program can't draw
+    // into a multiview framebuffer, so a combiner whose multiview build failed is skipped there.
+    const bool multiview = mFrameBuffers[mCurrentFrameBuffer].multiview;
+    GLuint program = mCurrentShaderProgram->openglProgramId;
+    OglProgramUniforms* uniforms = &mCurrentShaderProgram->uniforms;
+    if (multiview) {
+        if (!EnsureMultiviewProgram(mCurrentShaderProgram)) {
+            return;
+        }
+        program = mCurrentShaderProgram->multiviewProgramId;
+        uniforms = &mCurrentShaderProgram->multiviewUniforms;
+    }
+    if (program != mBoundProgram) {
+        glUseProgram(program);
+        mBoundProgram = program;
+    }
+    SetDrawUniforms(*uniforms, multiview);
 
     // printf("flushing %d tris\n", buf_vbo_num_tris);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(float) * buf_vbo_len, buf_vbo, GL_STREAM_DRAW);
-    glDrawArrays(GL_TRIANGLES, 0, 3 * buf_vbo_num_tris);
+    GLint first = 0;
+    const bool usedFallback = UploadVertices(buf_vbo, buf_vbo_len, mCurrentShaderProgram->numFloats, &first);
+    glDrawArrays(GL_TRIANGLES, first, 3 * buf_vbo_num_tris);
+#ifdef USE_OPENGLES
+    if (usedFallback) {
+        // Drew from the fallback buffer (see UploadVertices): point the attributes back at the ring.
+        glBindBuffer(GL_ARRAY_BUFFER, mRingVbo);
+        VertexArraySetAttribs(mCurrentShaderProgram);
+    }
+#endif
+}
+
+#ifdef USE_OPENGLES
+// GLES 3 lists extensions one by one (glGetStringi).
+static bool GlesHasExtension(const char* name) {
+    GLint n = 0;
+    glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+    for (GLint i = 0; i < n; i++) {
+        const char* e = reinterpret_cast<const char*>(glGetStringi(GL_EXTENSIONS, (GLuint)i));
+        if (e != nullptr && strcmp(e, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+#ifndef GL_MAP_PERSISTENT_BIT_EXT
+#define GL_MAP_PERSISTENT_BIT_EXT 0x0040
+#endif
+#ifndef GL_MAP_COHERENT_BIT_EXT
+#define GL_MAP_COHERENT_BIT_EXT 0x0080
+#endif
+typedef void (*PfnBufferStorageEXT)(GLenum target, GLsizeiptr size, const void* data, GLbitfield flags);
+
+// Waits for the GPU to finish reading a ring segment. Bounded: a GPU that is genuinely that far
+// behind gets the draw through the fallback buffer instead of a hang.
+static bool WaitRingFence(GLsync& fence) {
+    if (fence == nullptr) {
+        return true;
+    }
+    GLenum r = glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
+    for (int i = 0; i < 20 && r == GL_TIMEOUT_EXPIRED; i++) {
+        r = glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 5000000); // 5 ms, 100 ms in all
+    }
+    if (r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED) {
+        glDeleteSync(fence);
+        fence = nullptr;
+        return true;
+    }
+    return false;
+}
+#endif
+
+// Puts a draw's vertices where the bound attributes read them; *firstVertex = the glDrawArrays first
+// vertex. True = sent through the fallback buffer (the caller re-points the attributes afterwards).
+bool GfxRenderingAPIOGL::UploadVertices(const float* buf, size_t floats, size_t strideFloats, GLint* firstVertex) {
+    const size_t bytes = floats * sizeof(float);
+    *firstVertex = 0;
+#ifdef USE_OPENGLES
+    if (mRingPtr != nullptr) {
+        const size_t stride = std::max<size_t>(strideFloats, 1) * sizeof(float);
+        auto alignUp = [stride](size_t v) { return (v + stride - 1) / stride * stride; };
+        size_t offset = alignUp(mRingHead);
+        bool fits = offset + bytes <= (mRingSegment + 1) * kRingSegmentBytes;
+        if (!fits && bytes + stride <= kRingSegmentBytes) {
+            const size_t next = (mRingSegment + 1) % kRingSegments;
+            if (WaitRingFence(mRingFences[next])) {
+                // The segment being left is read by draws already queued: fence it.
+                mRingFences[mRingSegment] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+                mRingSegment = next;
+                offset = alignUp(next * kRingSegmentBytes);
+                fits = true;
+            }
+        }
+        if (fits) {
+            memcpy(mRingPtr + offset, buf, bytes);
+            mRingHead = offset + bytes;
+            *firstVertex = (GLint)(offset / stride);
+            return false;
+        }
+        glBindBuffer(GL_ARRAY_BUFFER, mFallbackVbo);
+        VertexArraySetAttribs(mCurrentShaderProgram);
+        glBufferData(GL_ARRAY_BUFFER, bytes, buf, GL_STREAM_DRAW);
+        return true;
+    }
+#endif
+    glBufferData(GL_ARRAY_BUFFER, bytes, buf, GL_STREAM_DRAW);
+    return false;
 }
 
 void GfxRenderingAPIOGL::Init() {
@@ -734,6 +962,35 @@ void GfxRenderingAPIOGL::Init() {
 #if defined(__APPLE__) || defined(USE_OPENGLES)
     glGenVertexArrays(1, &mOpenglVao);
     glBindVertexArray(mOpenglVao);
+#endif
+
+#ifdef USE_OPENGLES
+    // SOH [VR] Multiview shader extension (single-pass stereo, vr_gfx_opengl.cpp decides whether the
+    // eyes use it) and the persistent vertex ring.
+    mMultiviewExt = GlesHasExtension("GL_OVR_multiview2")  ? "GL_OVR_multiview2"
+                    : GlesHasExtension("GL_OVR_multiview") ? "GL_OVR_multiview"
+                                                           : nullptr;
+    PfnBufferStorageEXT bufferStorage = nullptr;
+    if (GlesHasExtension("GL_EXT_buffer_storage")) {
+        bufferStorage = reinterpret_cast<PfnBufferStorageEXT>(SDL_GL_GetProcAddress("glBufferStorageEXT"));
+    }
+    if (bufferStorage != nullptr) {
+        const size_t total = kRingSegments * kRingSegmentBytes;
+        const GLbitfield flags = GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT_EXT | GL_MAP_COHERENT_BIT_EXT;
+        glGenBuffers(1, &mRingVbo);
+        glBindBuffer(GL_ARRAY_BUFFER, mRingVbo);
+        bufferStorage(GL_ARRAY_BUFFER, (GLsizeiptr)total, nullptr, flags);
+        mRingPtr = static_cast<uint8_t*>(glMapBufferRange(GL_ARRAY_BUFFER, 0, (GLsizeiptr)total, flags));
+        if (mRingPtr == nullptr) {
+            glBindBuffer(GL_ARRAY_BUFFER, mOpenglVbo);
+            glDeleteBuffers(1, &mRingVbo);
+            mRingVbo = 0;
+        } else {
+            mFallbackVbo = mOpenglVbo; // stays bound to the ring from here on
+        }
+    }
+    SPDLOG_INFO("OpenGL ES: persistent vertex ring {}, multiview shaders {}", mRingPtr != nullptr ? "on" : "off",
+                mMultiviewExt != nullptr ? mMultiviewExt : "unavailable");
 #endif
 
 #ifndef USE_OPENGLES // not supported on gles
@@ -1127,7 +1384,7 @@ ImTextureID GfxRenderingAPIOGL::GetTextureById(int id) {
 // SOH [VR] The XR target is drawn like window fb 0 (invertY = false): GL images are bottom-up and
 // the OpenXR GL binding expects exactly that. One slot, reused for every XR image (only the FBO
 // name and size change); appended after the interpreter's framebuffers, so their ids never move.
-void GfxRenderingAPIOGL::SetExternalFramebuffer(GLuint fbo, uint32_t width, uint32_t height) {
+void GfxRenderingAPIOGL::SetExternalFramebuffer(GLuint fbo, uint32_t width, uint32_t height, bool multiview) {
     if (mExternalFbSlot < 0) {
         mExternalFbSlot = (int)mFrameBuffers.size();
         mFrameBuffers.resize(mFrameBuffers.size() + 1);
@@ -1142,6 +1399,7 @@ void GfxRenderingAPIOGL::SetExternalFramebuffer(GLuint fbo, uint32_t width, uint
     fb.msaa_level = 1;
     fb.has_depth_buffer = true;
     fb.invertY = false;
+    fb.multiview = multiview;
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     mCurrentFrameBuffer = (size_t)mExternalFbSlot;
 }

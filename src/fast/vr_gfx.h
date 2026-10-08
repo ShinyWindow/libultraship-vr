@@ -36,7 +36,10 @@ namespace vrgfx {
 // Menu = the SoH (ImGui) menu panel, drawn by the running ImGui renderer backend into the bound
 // image; Beam = the laser pointer's static gradient strip (filled once with ClearColorRects).
 // (Menu/Beam added October 6, additive: the leaves size their per-target arrays by Count.)
-enum class Target : int { Eye0, Eye1, Hud, Text, Screen, Menu, Beam, Count };
+// EyeArray = both eyes in ONE two-layer swapchain image, drawn in a single multiview pass (layer =
+// eye). Only used when the leaf says SupportsMultiview(); otherwise Eye0/Eye1 as before. (Added
+// October 7 for the Quest, additive.)
+enum class Target : int { Eye0, Eye1, Hud, Text, Screen, Menu, Beam, EyeArray, Count };
 
 // Desktop mirror slots: 0 = left eye, 1 = HUD, 2 = text panel, 3 = flat-screen panel.
 enum MirrorSlot : int { kMirrorEye = 0, kMirrorHud = 1, kMirrorText = 2, kMirrorScreen = 3, kMirrorCount = 4 };
@@ -92,6 +95,14 @@ class Backend {
     // this runtime + API expects them bottom-left, and the core flips them before xrEndFrame.
     // (Added in Track GL; whether GL needs it is runtime-verified with the test card.)
     virtual bool SubImageYUp() const {
+        return false;
+    }
+
+    // Single-pass stereo: true = this leaf can render Target::EyeArray (a two-layer swapchain,
+    // Attach'ed like any target, every pass on it covering both layers at once) and the running
+    // renderer draws into it with one program per combiner that places each vertex per layer.
+    // Valid after CheckRequirements. (Added October 7, additive.)
+    virtual bool SupportsMultiview() const {
         return false;
     }
 

@@ -148,13 +148,24 @@ static struct {
     // Per-frame
     XrFrameState frame_state;
     bool frame_began;
-    int current_eye;
+    int current_eye; // 0/1, or kCenterEye during a multiview pass
     uint32_t refresh_rate;  // Cached headset refresh in Hz, derived from predictedDisplayPeriod
     uint32_t current_image_index[2]; // Acquired swapchain image index per eye
 
-    // Cached per-frame matrices (row-major, row-vector convention)
-    float projection[2][4][4];
-    float view[2][4][4];
+    // Cached per-frame matrices (row-major, row-vector convention). Index 2 (kCenterEye) is the
+    // multiview pass's culling camera: see vr_build_center_view.
+    float projection[3][4][4];
+    float view[3][4][4];
+
+    // Single-pass stereo (multiview, GLES): both eyes in one two-layer swapchain (eye_swapchains[0]
+    // holds it; [1] keeps only the size), drawn by ONE interpreter run from the center camera. The
+    // GPU moves each vertex from the center camera's clip space into each eye's with mv_eye_mtx
+    // (one 4x4 per layer); eye-welded 2D (texrects, fills) uses identity instead (mv_welded).
+    bool multiview;      // the session was created with the array swapchain
+    bool multiview_pass; // inside vr_begin_stereo / vr_end_stereo
+    bool mv_welded;
+    uint32_t mv_gen;     // bumped whenever the matrices the renderer should use change
+    float mv_eye_mtx[2][16];
 
     // Configuration
     float world_scale;       // N64 units per meter
@@ -384,6 +395,8 @@ static struct {
     bool presence_confirmed;
 } xr = {};
 
+static constexpr int kCenterEye = 2;
+
 static void vr_restore_eye_dimensions() {
     const auto& sc = xr.eye_swapchains[0];
     if (sc.width > 0 && sc.height > 0) {
@@ -453,6 +466,162 @@ static void pose_to_view_matrix(const XrPosef& pose, float world_scale, float ou
     for (int r = 0; r < 4; r++)
         for (int c = 0; c < 4; c++)
             out[r][c] = view[r][c];
+}
+
+// --------------------------------------------------------------------------
+// Single-pass stereo: the center camera and the per-layer transforms
+// --------------------------------------------------------------------------
+
+static void mat4_from_float(double out[4][4], const float in[4][4]) {
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+            out[r][c] = in[r][c];
+}
+
+static void mat4_mul_d(double res[4][4], const double a[4][4], const double b[4][4]) {
+    double tmp[4][4];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+            tmp[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j] + a[i][3] * b[3][j];
+    memcpy(res, tmp, sizeof(tmp));
+}
+
+// Gauss-Jordan with partial pivoting. False = singular.
+static bool mat4_inverse_d(const double m[4][4], double out[4][4]) {
+    double a[4][8];
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 4; c++) {
+            a[r][c] = m[r][c];
+            a[r][c + 4] = (r == c) ? 1.0 : 0.0;
+        }
+    }
+    for (int col = 0; col < 4; col++) {
+        int pivot = col;
+        for (int r = col + 1; r < 4; r++) {
+            if (fabs(a[r][col]) > fabs(a[pivot][col])) pivot = r;
+        }
+        if (fabs(a[pivot][col]) < 1e-12) return false;
+        if (pivot != col) {
+            for (int c = 0; c < 8; c++) std::swap(a[col][c], a[pivot][c]);
+        }
+        const double inv = 1.0 / a[col][col];
+        for (int c = 0; c < 8; c++) a[col][c] *= inv;
+        for (int r = 0; r < 4; r++) {
+            if (r == col) continue;
+            const double f = a[r][col];
+            if (f == 0.0) continue;
+            for (int c = 0; c < 8; c++) a[r][c] -= f * a[col][c];
+        }
+    }
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+            out[r][c] = a[r][c + 4];
+    return true;
+}
+
+// Per-layer transforms for the multiview programs: clip_eye = clip_center * inv(VP_c) * VP_e. The
+// anchored view the interpreter uses is A * view for every camera with the same A (vr_get_view_
+// matrix), so inv(A v_c P_c) A v_e P_e = inv(P_c) inv(v_c) v_e P_e: the anchor (big game-unit
+// translations) cancels, and the raw per-frame matrices give the exact answer. Stored row-major,
+// uploaded untransposed, which is what GLSL's  M * v  needs for the engine's row-vector  v * C.
+static void vr_update_multiview_matrices() {
+    double vpc[4][4], v[4][4], p[4][4], inv[4][4];
+    mat4_from_float(v, xr.view[kCenterEye]);
+    mat4_from_float(p, xr.projection[kCenterEye]);
+    mat4_mul_d(vpc, v, p);
+    const bool ok = mat4_inverse_d(vpc, inv);
+    for (int eye = 0; eye < 2; eye++) {
+        double vpe[4][4], c[4][4];
+        mat4_from_float(v, xr.view[eye]);
+        mat4_from_float(p, xr.projection[eye]);
+        mat4_mul_d(vpe, v, p);
+        if (ok) {
+            mat4_mul_d(c, inv, vpe);
+        }
+        for (int r = 0; r < 4; r++)
+            for (int col = 0; col < 4; col++)
+                xr.mv_eye_mtx[eye][r * 4 + col] = ok ? (float)c[r][col] : (r == col ? 1.0f : 0.0f);
+    }
+    xr.mv_gen++;
+}
+
+// The multiview pass runs the display list ONCE, so the interpreter's CPU-side clip rejection,
+// backface culling and fog need one camera whose view contains everything either eye sees: the
+// center camera. Orientation = the eyes' average; field of view = the union of both eyes' edge
+// directions in that frame; apex pulled back along its forward axis until both eye positions are
+// inside. A frustum is a convex cone, so containing an eye's apex and all of its edge directions
+// means containing its whole frustum: nothing either eye can see is rejected. (The pull-back is
+// about half the IPD over the tangent of the outer half-angle: ~3 cm on a Quest 3.) Backface
+// culling decides from this viewpoint for both eyes; a triangle within a degree or two of edge-on
+// can disagree with one eye, which at that angle covers next to no pixels.
+static void vr_build_center_view() {
+    if (!xr.multiview) {
+        return;
+    }
+    glm::quat q[2];
+    glm::vec3 e[2];
+    for (int i = 0; i < 2; i++) {
+        const XrPosef& pose = xr.views[i].pose;
+        q[i] = glm::quat(pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z);
+        e[i] = glm::vec3(pose.position.x, pose.position.y, pose.position.z);
+    }
+    if (glm::dot(q[0], q[1]) < 0.0f) {
+        q[1] = -q[1];
+    }
+    glm::quat qc = q[0] + q[1];
+    const float qlen = glm::length(qc);
+    if (qlen < 1e-6f) {
+        return;
+    }
+    qc *= (1.0f / qlen);
+    const glm::mat3 R = glm::mat3_cast(qc);
+    const glm::mat3 Rt = glm::transpose(R);
+    const glm::vec3 mid = 0.5f * (e[0] + e[1]);
+
+    float minX = -1e-3f, maxX = 1e-3f, minY = -1e-3f, maxY = 1e-3f;
+    for (int i = 0; i < 2; i++) {
+        const XrFovf& f = xr.views[i].fov;
+        const glm::mat3 Re = glm::mat3_cast(q[i]);
+        const float tx[2] = { tanf(f.angleLeft), tanf(f.angleRight) };
+        const float ty[2] = { tanf(f.angleDown), tanf(f.angleUp) };
+        for (float x : tx) {
+            for (float y : ty) {
+                const glm::vec3 d = Rt * (Re * glm::vec3(x, y, -1.0f));
+                if (d.z > -1e-4f) {
+                    continue; // an edge at or past 90 degrees off the center axis: not a real headset
+                }
+                minX = std::min(minX, d.x / -d.z);
+                maxX = std::max(maxX, d.x / -d.z);
+                minY = std::min(minY, d.y / -d.z);
+                maxY = std::max(maxY, d.y / -d.z);
+            }
+        }
+    }
+
+    // Apex at local (0, 0, back) (forward is -Z). An eye at local p sits inside when its tangents
+    // from the apex, p.xy / (back - p.z), are within the union.
+    float back = 0.0f;
+    for (int i = 0; i < 2; i++) {
+        const glm::vec3 p = Rt * (e[i] - mid);
+        auto need = [](float c, float lo, float hi) { return c > 0.0f ? c / hi : (c < 0.0f ? c / lo : 0.0f); };
+        back = std::max(back, p.z + std::max(need(p.x, minX, maxX), need(p.y, minY, maxY)));
+    }
+    back = back * 1.02f + 0.001f;
+
+    const glm::vec3 pc = mid + R * glm::vec3(0.0f, 0.0f, back);
+    XrPosef center;
+    center.position = { pc.x, pc.y, pc.z };
+    center.orientation = { qc.x, qc.y, qc.z, qc.w };
+    XrFovf fov;
+    fov.angleLeft = atanf(minX);
+    fov.angleRight = atanf(maxX);
+    fov.angleDown = atanf(minY);
+    fov.angleUp = atanf(maxY);
+    pose_to_view_matrix(center, xr.world_scale, xr.view[kCenterEye]);
+    // The far plane moves back with the apex, so the eyes' far planes stay inside it.
+    build_projection_matrix(fov, xr.near_clip, xr.far_clip + 2.0f * back * xr.world_scale,
+                            xr.projection[kCenterEye]);
+    vr_update_multiview_matrices();
 }
 
 // --------------------------------------------------------------------------
@@ -1294,6 +1463,7 @@ void vr_commit_pending_snap_turn() {
         rotate_about_pivot(xr.views[eye].pose);
         pose_to_view_matrix(xr.views[eye].pose, xr.world_scale, xr.view[eye]);
     }
+    vr_build_center_view();
     for (int h = 0; h < 2; h++) {
         if (xr.hand_active[h]) {
             rotate_about_pivot(xr.grip_pose[h]);
@@ -1805,7 +1975,7 @@ static bool vr_instance_init() {
 // One XR swapchain of the given size + the backend's per-image color/depth targets for it.
 // The core keeps only the handle and size; the backend owns every API object.
 static bool vr_create_swapchain(vrgfx::Target t, decltype(xr.hud_swapchain)& sc, uint32_t w, uint32_t h, int64_t fmt,
-                                const char* label) {
+                                const char* label, uint32_t array_size = 1) {
     sc.width = w;
     sc.height = h;
     sc.format = fmt;
@@ -1818,7 +1988,7 @@ static bool vr_create_swapchain(vrgfx::Target t, decltype(xr.hud_swapchain)& sc,
     swapchain_ci.width = w;
     swapchain_ci.height = h;
     swapchain_ci.faceCount = 1;
-    swapchain_ci.arraySize = 1;
+    swapchain_ci.arraySize = array_size;
     swapchain_ci.mipCount = 1;
 
     const std::string what = std::string("xrCreateSwapchain (") + label + ")";
@@ -1921,10 +2091,9 @@ static bool vr_session_init() {
     // written verbatim; UNORM fallback with a gamma mismatch.
     const int64_t chosen_format = xr.gfx->ChooseColorFormat(formats);
 
-    // --- Create Swapchains (one per eye) ---
+    // --- Create Swapchains (one per eye, or one two-layer swapchain for single-pass stereo) ---
+    uint32_t eye_w[2], eye_h[2];
     for (uint32_t eye = 0; eye < 2; eye++) {
-        auto& sc = xr.eye_swapchains[eye];
-
         // Apply the resolution multiplier, then clamp to what the runtime allows.
         uint32_t scaled_w = (uint32_t)lroundf(xr.config_views[eye].recommendedImageRectWidth * xr.resolution_scale);
         uint32_t scaled_h = (uint32_t)lroundf(xr.config_views[eye].recommendedImageRectHeight * xr.resolution_scale);
@@ -1932,13 +2101,45 @@ static bool vr_session_init() {
         if (scaled_h < 1) scaled_h = 1;
         if (scaled_w > xr.config_views[eye].maxImageRectWidth) scaled_w = xr.config_views[eye].maxImageRectWidth;
         if (scaled_h > xr.config_views[eye].maxImageRectHeight) scaled_h = xr.config_views[eye].maxImageRectHeight;
+        eye_w[eye] = scaled_w;
+        eye_h[eye] = scaled_h;
 
         spdlog::info("[VR] Eye {} render resolution: {}x{} (recommended {}x{}, scale {:.2f})", eye, scaled_w, scaled_h,
                      xr.config_views[eye].recommendedImageRectWidth, xr.config_views[eye].recommendedImageRectHeight,
                      xr.resolution_scale);
+    }
 
-        if (!vr_create_swapchain(eye == 0 ? vrgfx::Target::Eye0 : vrgfx::Target::Eye1, sc, scaled_w, scaled_h,
-                                 chosen_format, eye == 0 ? "eye 0" : "eye 1")) {
+    // Single-pass stereo (gVrMultiview, takes effect when the session starts): both eyes in one
+    // two-layer swapchain at the larger eye's size. Any failure falls back to two swapchains.
+#ifdef __ANDROID__
+    constexpr int kMultiviewDefault = 1;
+#else
+    constexpr int kMultiviewDefault = 0;
+#endif
+    xr.multiview = false;
+    if (CVarGetInteger("gVrMultiview", kMultiviewDefault) && xr.gfx->SupportsMultiview()) {
+        auto& sc = xr.eye_swapchains[0];
+        const uint32_t w = std::max(eye_w[0], eye_w[1]);
+        const uint32_t h = std::max(eye_h[0], eye_h[1]);
+        if (vr_create_swapchain(vrgfx::Target::EyeArray, sc, w, h, chosen_format, "eyes (multiview)", 2)) {
+            xr.eye_swapchains[1] = sc;
+            xr.eye_swapchains[1].handle = XR_NULL_HANDLE; // size only; the layers live in [0]
+            xr.multiview = true;
+            vr_build_center_view();
+        } else {
+            spdlog::warn("[VR] Multiview eye swapchain failed; rendering the eyes in two passes");
+            xr.gfx->Detach(vrgfx::Target::EyeArray);
+            if (sc.handle != XR_NULL_HANDLE) {
+                xrDestroySwapchain(sc.handle);
+                sc.handle = XR_NULL_HANDLE;
+            }
+        }
+    }
+    spdlog::info("[VR] Stereo rendering: {}", xr.multiview ? "single pass (multiview)" : "one pass per eye");
+
+    for (uint32_t eye = 0; eye < 2 && !xr.multiview; eye++) {
+        if (!vr_create_swapchain(eye == 0 ? vrgfx::Target::Eye0 : vrgfx::Target::Eye1, xr.eye_swapchains[eye],
+                                 eye_w[eye], eye_h[eye], chosen_format, eye == 0 ? "eye 0" : "eye 1")) {
             vr_shutdown();
             return false;
         }
@@ -2011,6 +2212,8 @@ void vr_shutdown() {
     xr.text_was_visible = false;
     xr.head_raw_valid = false;
     xr.eyes_ever_rendered = false;
+    xr.multiview = false;
+    xr.multiview_pass = false;
     xr.flat_screen = false;
     xr.flat_screen_prev = false;
 
@@ -2613,6 +2816,7 @@ bool vr_begin_frame() {
         build_projection_matrix(xr.views[eye].fov, xr.near_clip, xr.far_clip, xr.projection[eye]);
         pose_to_view_matrix(xr.views[eye].pose, xr.world_scale, xr.view[eye]);
     }
+    vr_build_center_view();
 
     return true;
 }
@@ -2943,13 +3147,15 @@ void vr_end_frame() {
         // against where the player's head actually is, or the compositor would fight the snap turn.
         projection_views[eye].pose = xr.submit_pose[eye];
         projection_views[eye].fov = xr.submit_fov[eye];
-        projection_views[eye].subImage.swapchain = xr.eye_swapchains[eye].handle;
+        // Multiview: both eyes are layers of the one swapchain in eye_swapchains[0].
+        projection_views[eye].subImage.swapchain = xr.multiview ? xr.eye_swapchains[0].handle
+                                                                : xr.eye_swapchains[eye].handle;
         projection_views[eye].subImage.imageRect.offset = { 0, 0 };
         projection_views[eye].subImage.imageRect.extent = {
             static_cast<int32_t>(xr.eye_swapchains[eye].width),
             static_cast<int32_t>(xr.eye_swapchains[eye].height)
         };
-        projection_views[eye].subImage.imageArrayIndex = 0;
+        projection_views[eye].subImage.imageArrayIndex = xr.multiview ? (uint32_t)eye : 0;
     }
 
     XrCompositionLayerProjection projection_layer = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
@@ -3275,7 +3481,15 @@ void vr_end_frame() {
 // --------------------------------------------------------------------------
 
 static vrgfx::Target vr_eye_target(int eye) {
+    if (xr.multiview) {
+        return vrgfx::Target::EyeArray;
+    }
     return eye == 0 ? vrgfx::Target::Eye0 : vrgfx::Target::Eye1;
+}
+
+// The acquired image of the eye pass in progress (a multiview pass has one image for both eyes).
+static uint32_t vr_current_eye_image() {
+    return xr.current_image_index[xr.multiview_pass ? 0 : (xr.current_eye & 1)];
 }
 
 // Dev test card (gVrGfxTestCard, VR-MULTI-API-PLAN.md 9.1), drawn into a target after the game:
@@ -3355,6 +3569,79 @@ void vr_end_eye(int eye) {
 
     XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
     xr_check(xrReleaseSwapchainImage(sc.handle, &release_info), "xrReleaseSwapchainImage");
+}
+
+// Single-pass stereo: one interpreter run draws both layers of the eye swapchain from the center
+// camera (vr_build_center_view); the renderer's multiview programs place each vertex per layer.
+bool vr_multiview_enabled() {
+    return xr.initialized && xr.multiview;
+}
+
+void vr_begin_stereo() {
+    if (!xr.initialized || !xr.multiview) return;
+    xr.current_eye = kCenterEye;
+    xr.multiview_pass = true;
+    xr.eyes_ever_rendered = true;
+    xr.mv_welded = false;
+    xr.mv_gen++;
+
+    auto& sc = xr.eye_swapchains[0];
+    XrSwapchainImageAcquireInfo acquire_info = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+    uint32_t image_index = 0;
+    xr_check(xrAcquireSwapchainImage(sc.handle, &acquire_info, &image_index), "xrAcquireSwapchainImage");
+    xr.current_image_index[0] = xr.current_image_index[1] = image_index;
+
+    XrSwapchainImageWaitInfo wait_info = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+    wait_info.timeout = XR_INFINITE_DURATION;
+    xr_check(xrWaitSwapchainImage(sc.handle, &wait_info), "xrWaitSwapchainImage");
+
+    const float clear_color[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    xr.gfx->BeginPass(vrgfx::Target::EyeArray, image_index, clear_color);
+    vr_apply_dimensions(sc.width, sc.height);
+}
+
+void vr_end_stereo() {
+    if (!xr.initialized || !xr.multiview_pass) return;
+    auto& sc = xr.eye_swapchains[0];
+    const uint32_t image = xr.current_image_index[0];
+    vr_draw_test_card(vrgfx::Target::EyeArray, image, sc.width, sc.height);
+    if (xr.plan_present_desktop) {
+        vr_capture_mirror();
+    }
+    xr.gfx->EndPass(vrgfx::Target::EyeArray, image);
+
+    XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+    xr_check(xrReleaseSwapchainImage(sc.handle, &release_info), "xrReleaseSwapchainImage");
+    xr.multiview_pass = false;
+    xr.current_eye = 0;
+}
+
+bool vr_is_multiview_pass() {
+    return xr.multiview_pass;
+}
+
+bool vr_multiview_eye_welded() {
+    return xr.mv_welded;
+}
+
+// Eye-welded 2D (texrects and fills that cover each eye's own view) must land identically on both
+// layers: identity transforms. The interpreter flushes before switching.
+void vr_set_multiview_eye_welded(bool welded) {
+    if (welded != xr.mv_welded) {
+        xr.mv_welded = welded;
+        xr.mv_gen++;
+    }
+}
+
+const float* vr_get_multiview_eye_matrices(uint32_t* generation) {
+    static const float kIdentity[2][16] = {
+        { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 },
+        { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 },
+    };
+    if (generation != nullptr) {
+        *generation = xr.mv_gen;
+    }
+    return xr.mv_welded ? &kIdentity[0][0] : &xr.mv_eye_mtx[0][0];
 }
 
 // --------------------------------------------------------------------------
@@ -4321,7 +4608,7 @@ void vr_clear_current_eye_depth() {
     if (!xr.initialized || !xr.frame_began || xr.rendering_screen || xr.rendering_text || xr.rendering_hud) {
         return;
     }
-    xr.gfx->ClearDepth(vr_eye_target(xr.current_eye), xr.current_image_index[xr.current_eye]);
+    xr.gfx->ClearDepth(vr_eye_target(xr.current_eye), vr_current_eye_image());
 }
 
 void vr_rebind_current_eye_target() {
@@ -4337,7 +4624,7 @@ void vr_rebind_current_eye_target() {
     } else if (xr.rendering_hud) {
         xr.gfx->Rebind(vrgfx::Target::Hud, xr.hud_image_index);
     } else {
-        xr.gfx->Rebind(vr_eye_target(xr.current_eye), xr.current_image_index[xr.current_eye]);
+        xr.gfx->Rebind(vr_eye_target(xr.current_eye), vr_current_eye_image());
     }
 }
 
@@ -4976,7 +5263,7 @@ void vr_get_2d_target_size(uint32_t* w, uint32_t* h) {
 
 void vr_capture_mirror() {
     if (!xr.initialized || !xr.gfx) return;
-    xr.gfx->CopyToMirror(vrgfx::Target::Eye0, xr.current_image_index[0], vrgfx::kMirrorEye);
+    xr.gfx->CopyToMirror(vr_eye_target(0), xr.current_image_index[0], vrgfx::kMirrorEye); // layer 0 when multiview
 }
 
 bool vr_get_mirror_flip_v() {
@@ -5073,6 +5360,20 @@ void vr_get_frame_stats(struct VrFrameStats* out) {
 }
 void vr_begin_eye(int) {}
 void vr_end_eye(int) {}
+bool vr_multiview_enabled() { return false; }
+void vr_begin_stereo() {}
+void vr_end_stereo() {}
+bool vr_is_multiview_pass() { return false; }
+bool vr_multiview_eye_welded() { return false; }
+void vr_set_multiview_eye_welded(bool) {}
+const float* vr_get_multiview_eye_matrices(uint32_t* generation) {
+    static const float kIdentity[32] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
+                                         1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+    if (generation != nullptr) {
+        *generation = 0;
+    }
+    return kIdentity;
+}
 void vr_get_projection_matrix(int, float out[4][4]) { memset(out, 0, sizeof(float) * 16); }
 void vr_get_fog_ndc_z_params(float* a, float* b) { *a = *b = 0.0f; }
 void vr_get_view_matrix(int, float out[4][4]) { memset(out, 0, sizeof(float) * 16); }
