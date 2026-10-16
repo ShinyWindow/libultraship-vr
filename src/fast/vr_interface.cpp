@@ -77,6 +77,22 @@ void VR_SetViewFade(float fade) {
     vr_set_view_fade(fade);
 }
 
+void VR_ResetTransitionFade(void) {
+    vr_reset_transition_fade();
+}
+
+void VR_AddTransitionFade(uint8_t r, uint8_t g, uint8_t b, uint8_t alpha) {
+    vr_add_transition_fade(r, g, b, alpha);
+}
+
+bool VR_CanCompositorFade(void) {
+    return vr_transition_fade_supported();
+}
+
+void VR_SetNotificationsVisible(bool visible) {
+    vr_set_notifications_visible(visible);
+}
+
 void VR_SetCameraYaw(int16_t yaw_binang) {
     vr_set_camera_yaw(yaw_binang);
 }

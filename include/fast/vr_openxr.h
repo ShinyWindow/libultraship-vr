@@ -120,6 +120,9 @@ void vr_set_world_scale(float units_per_meter);
 void vr_set_link_eye_height(float units);
 // Alyx-style in-wall fade target (0 clear .. 1 black); world layer only, smoothed per XR frame.
 void vr_set_view_fade(float fade);
+void vr_reset_transition_fade();
+void vr_add_transition_fade(uint8_t r, uint8_t g, uint8_t b, uint8_t alpha);
+bool vr_transition_fade_supported();
 
 // First-person camera
 void vr_set_first_person(bool enabled);
@@ -254,6 +257,8 @@ struct VrMenuPointer {
     int hand;
 };
 bool vr_menu_panel_active();
+bool vr_menu_interactive();
+void vr_set_notifications_visible(bool visible);
 // False on standalone headsets (Android): VR can't be switched off there (no flat screen exists);
 // the VR Mode checkbox and F9 are hidden / ignored, and doffing never drops to flat.
 bool vr_can_disable();

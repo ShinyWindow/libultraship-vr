@@ -401,6 +401,7 @@ static struct {
     float refresh_rate_applied;
     float view_fade_target;
     float view_fade_current;
+    float transition_fade[4]; // linear compositor RGB + alpha; reset and rebuilt by the game each tick
 
     // Connection lifecycle (vr_apply_mode_request). A session the runtime lost or ended is only
     // flagged where it is noticed and torn down at the next tick boundary, where no display list or
@@ -1276,6 +1277,7 @@ static struct {
     uint16_t latch_buttons[2];
     bool latch_trigger[2], latch_squeeze[2], latch_stick[2];
 } g_menu = { false, {}, {}, false, false, 0.0, 0.0, -1 };
+static bool g_notifications_visible = false;
 
 static std::shared_ptr<Ship::GuiWindow> vr_menu_window() {
     Ship::Context* ctx = Ship::Context::GetRawInstance();
@@ -1484,7 +1486,20 @@ static void vr_menu_fill_beam() {
 }
 
 bool vr_menu_panel_active() {
+    return xr.initialized && xr.enabled && xr.session_running && (g_menu.open || g_notifications_visible);
+}
+
+bool vr_menu_interactive() {
     return xr.initialized && xr.enabled && xr.session_running && g_menu.open;
+}
+
+void vr_set_notifications_visible(bool visible) {
+    if (visible && !g_notifications_visible) {
+        // Do not expose the previous interactive-menu image for one frame while the notification
+        // ImGui draw data is still being rendered into this shared transparent swapchain.
+        xr.menu_ever_rendered = false;
+    }
+    g_notifications_visible = visible;
 }
 
 void vr_menu_panel_size(int* w, int* h) {
@@ -3569,20 +3584,26 @@ void vr_end_frame() {
     // the head so it reads as a line from any angle.
     XrCompositionLayerQuad menu_layer = { XR_TYPE_COMPOSITION_LAYER_QUAD };
     XrCompositionLayerQuad beam_layer = { XR_TYPE_COMPOSITION_LAYER_QUAD };
-    const bool menu_visible = g_menu.open && xr.menu_ever_rendered;
+    const bool notification_visible = g_notifications_visible && !g_menu.open;
+    const bool menu_visible = (g_menu.open || notification_visible) && xr.menu_ever_rendered;
     bool beam_visible = false;
     if (menu_visible) {
         menu_layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
         menu_layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-        menu_layer.space = xr.local_space;
+        menu_layer.space = notification_visible ? xr.view_space : xr.local_space;
         menu_layer.subImage.swapchain = xr.menu_swapchain.handle;
         menu_layer.subImage.imageRect.offset = { 0, 0 };
         menu_layer.subImage.imageRect.extent = { (int32_t)xr.menu_swapchain.width, (int32_t)xr.menu_swapchain.height };
-        menu_layer.pose = g_menu.pose;
-        menu_layer.size = { g_menu.size[0], g_menu.size[1] };
+        if (notification_visible) {
+            menu_layer.pose = { { 0, 0, 0, 1 }, { 0.0f, 0.0f, -1.35f } };
+            menu_layer.size = { 1.4f, 1.4f * (float)kMenuPanelH / (float)kMenuPanelW };
+        } else {
+            menu_layer.pose = g_menu.pose;
+            menu_layer.size = { g_menu.size[0], g_menu.size[1] };
+        }
 
         const int bh = g_menu.hand;
-        if (xr.beam_ready && bh >= 0 && xr.hand_active[bh] && xr.head_raw_valid) {
+        if (g_menu.open && xr.beam_ready && bh >= 0 && xr.hand_active[bh] && xr.head_raw_valid) {
             const XrPosef& a = xr.aim_pose_raw[bh];
             const glm::vec3 o(a.position.x, a.position.y, a.position.z);
             const glm::vec3 d = glm::normalize(
@@ -3680,6 +3701,24 @@ void vr_end_frame() {
     }
     if (beam_visible) {
         layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&beam_layer);
+    }
+
+    // Game transitions are authored as full-screen rectangles on a television. In VR that exposes
+    // the rectangular panel boundary, so the game suppresses those rectangles and reports their
+    // colour/opacity here instead. Apply the same fade to every submitted composition layer; the
+    // opaque OpenXR environment is already black outside them, producing one seamless headset view.
+    XrCompositionLayerColorScaleBiasKHR transition_scales[10] = {};
+    if (xr.color_scale_supported && xr.transition_fade[3] > 0.001f) {
+        const float a = std::clamp(xr.transition_fade[3], 0.0f, 1.0f);
+        for (uint32_t i = 0; i < layer_count; i++) {
+            auto& scale = transition_scales[i];
+            scale.type = XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR;
+            scale.next = layers[i]->next;
+            scale.colorScale = { 1.0f - a, 1.0f - a, 1.0f - a, 1.0f };
+            scale.colorBias = { xr.transition_fade[0] * a, xr.transition_fade[1] * a,
+                                xr.transition_fade[2] * a, 0.0f };
+            const_cast<XrCompositionLayerBaseHeader*>(layers[i])->next = &scale;
+        }
     }
 
     // Sub-image rects are computed top-left (and recorded that way for the mirror above). A backend
@@ -4879,6 +4918,24 @@ void vr_set_view_fade(float fade) {
     xr.view_fade_target = fminf(fmaxf(fade, 0.0f), 1.0f);
 }
 
+void vr_reset_transition_fade() {
+    xr.transition_fade[0] = xr.transition_fade[1] = xr.transition_fade[2] = xr.transition_fade[3] = 0.0f;
+}
+
+void vr_add_transition_fade(uint8_t r, uint8_t g, uint8_t b, uint8_t alpha) {
+    if (!xr.initialized || alpha <= (uint8_t)(xr.transition_fade[3] * 255.0f)) {
+        return;
+    }
+    xr.transition_fade[0] = r / 255.0f;
+    xr.transition_fade[1] = g / 255.0f;
+    xr.transition_fade[2] = b / 255.0f;
+    xr.transition_fade[3] = alpha / 255.0f;
+}
+
+bool vr_transition_fade_supported() {
+    return xr.initialized && xr.color_scale_supported;
+}
+
 void vr_clear_current_eye_depth() {
     if (!xr.initialized || !xr.frame_began || xr.rendering_screen || xr.rendering_text || xr.rendering_hud) {
         return;
@@ -5669,6 +5726,9 @@ float vr_get_world_scale() { return 1.0f; }
 void vr_set_world_scale(float) {}
 void vr_set_link_eye_height(float) {}
 void vr_set_view_fade(float) {}
+void vr_reset_transition_fade() {}
+void vr_add_transition_fade(uint8_t, uint8_t, uint8_t, uint8_t) {}
+bool vr_transition_fade_supported() { return false; }
 void vr_set_first_person(bool) {}
 bool vr_is_first_person() { return false; }
 void vr_set_camera_anchor(float, float, float) {}
@@ -5763,6 +5823,8 @@ void vr_begin_text() {}
 void vr_end_text() {}
 bool vr_is_rendering_text() { return false; }
 bool vr_menu_panel_active() { return false; }
+bool vr_menu_interactive() { return false; }
+void vr_set_notifications_visible(bool) {}
 bool vr_can_disable() { return true; }
 int vr_get_supported_refresh_rates(float*, int) { return 0; }
 void vr_menu_panel_size(int* w, int* h) { *w = 0; *h = 0; }

@@ -658,7 +658,7 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
         presentDesktop = (mVrFrameCounter % desktopDivisor) == 0u;
         // The SoH menu panel's ImGui frame runs every XR frame, and on PC that frame is also the
         // desktop's (Fast3dGuiVrMenu.cpp), so the desktop presents every frame while it is open.
-        if (vr_menu_panel_active()) {
+        if (vr_menu_interactive()) {
             presentDesktop = true;
         }
 #ifdef __ANDROID__
