@@ -50,6 +50,7 @@ struct VrHudElementDesc {
 // Element offsets are the same for both ages (the user's adult layout).
 #define VR_HUD_EL_DEFAULT { 0.0f, 0.0f }, { 0.0f, 0.0f }, { 100.0f, 100.0f }, { 1, 1 }
 #define VR_HUD_EL_AT(x, y) { x, x }, { y, y }, { 100.0f, 100.0f }, { 1, 1 }
+#define VR_HUD_EL_KEY_CARD { 0.0f, 0.0f }, { 90.0f, 90.0f }, { 460.0f, 460.0f }, { 1, 1 }
 static const VrHudElementDesc kVrHudElements[] = {
     { VR_HUD_EL_HEARTS, "Hearts", "Hearts", 0, VR_HUD_EL_AT(3.0f, 0.0f) },
     { VR_HUD_EL_MAGIC, "Magic", "Magic Bar", 0, VR_HUD_EL_AT(-25.0f, -3.0f) },
@@ -66,7 +67,10 @@ static const VrHudElementDesc kVrHudElements[] = {
     { VR_HUD_EL_BTN_DPAD, "DPad", "D-Pad", 1, VR_HUD_EL_DEFAULT },
     { VR_HUD_EL_MOUNT, "Mount", "Carrots / Archery Score", 1, VR_HUD_EL_DEFAULT },
     { VR_HUD_EL_MINIMAP, "Minimap", "Minimap", 1, VR_HUD_EL_AT(-1.0f, -11.0f) },
+    { VR_HUD_EL_PHYSICAL_KEYS, "PhysicalKeys", "Physical Small Keys", 0, VR_HUD_EL_KEY_CARD },
+    { VR_HUD_EL_PHYSICAL_BOSS_KEY, "PhysicalBossKey", "Physical Boss Key", 0, VR_HUD_EL_KEY_CARD },
 };
+#undef VR_HUD_EL_KEY_CARD
 #undef VR_HUD_EL_AT
 #undef VR_HUD_EL_DEFAULT
 static const int kVrHudElementCount = (int)(sizeof(kVrHudElements) / sizeof(kVrHudElements[0]));

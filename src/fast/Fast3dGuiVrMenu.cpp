@@ -129,7 +129,7 @@ void Fast3dGui::VrMenuNewFrame() {
     vr_menu_panel_size(&w, &h);
     io.DisplaySize = ImVec2((float)w, (float)h);
     io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
-    io.MouseDrawCursor = true; // the cursor on the panel shows where the ray lands
+    io.MouseDrawCursor = vr_menu_interactive(); // passive notification panels never show a pointer
 
     VrMenuPointer p;
     vr_menu_take_pointer(&p);

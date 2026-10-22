@@ -1,8 +1,9 @@
 #ifdef ENABLE_DX11
 
 #include <cstdio>
-#include <vector>
 #include <cmath>
+#include <utility>
+#include <vector>
 
 #include <map>
 #include <unordered_map>
@@ -277,14 +278,19 @@ void GfxRenderingAPIDX11::Init() {
         mContext->Flush();
 
         mLastShaderProgram = nullptr;
+        mLastGeometryShader = nullptr;
+        mGeometryShaderStateKnown = true; // ClearState guarantees a null geometry stage.
+        mMultiviewTarget = false;
+        mVrVisibilityMaskTarget = false;
+        mVrEyeCbBound = false;
+        mVrEyeGeneration = UINT32_MAX;
         mLastBlendState.Reset();
         for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
             mLastResourceViews[i].Reset();
             mLastSamplerStates[i].Reset();
         }
-        mLastDepthTest = -1;
-        mLastDepthMask = -1;
-        mLastZmodeDecal = -1;
+        mBoundDepthStencilStateKey = 0xFFu;
+        mBoundRasterizerStateKey = ~uint64_t{ 0 };
         mLastPrimitaveTopology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
     });
 
@@ -447,6 +453,90 @@ void GfxRenderingAPIDX11::LoadShader(struct ShaderProgram* new_prg) {
 
 void GfxRenderingAPIDX11::ClearShaderCache() {
     mShaderProgramPool.clear();
+    mShaderProgram = nullptr;
+    mLastShaderProgram = nullptr;
+    mLastGeometryShader = nullptr;
+    mGeometryShaderStateKnown = !mMultiviewTarget;
+}
+
+// SOH [VR] Add a geometry shader to the already-expanded Prism HLSL at runtime. Shaders live in
+// soh.o2r, which is not rebuilt by an ordinary C++ build, so doing the same kind of source rewrite
+// as the GLES multiview path keeps the executable and an existing archive compatible. Embedding
+// PSInput in the GS output preserves every generated/custom varying without having to enumerate
+// them; HLSL flattens their semantics at the GS/rasterizer boundary.
+static std::string MakeMultiviewGeometryShader(const std::string& shader) {
+    std::string gs;
+    gs.reserve(shader.size() + 1024);
+    gs = shader;
+    gs += R"(
+
+struct VrGSOutput {
+    PSInput vertex;
+    uint vrLayer : SV_RenderTargetArrayIndex;
+};
+
+cbuffer VrEyeCB : register(b3) {
+    column_major float4x4 uVrEyeMtx[2];
+};
+
+[maxvertexcount(6)]
+void GSMain(triangle PSInput vertices[3], inout TriangleStream<VrGSOutput> stream) {
+    [unroll]
+    for (uint eye = 0; eye < 2; ++eye) {
+        [unroll]
+        for (uint vertex = 0; vertex < 3; ++vertex) {
+            VrGSOutput result;
+            result.vertex = vertices[vertex];
+            result.vertex.position = mul(uVrEyeMtx[eye], vertices[vertex].position);
+            result.vrLayer = eye;
+            stream.Append(result);
+        }
+        stream.RestartStrip();
+    }
+}
+)";
+    return gs;
+}
+
+bool GfxRenderingAPIDX11::EnsureMultiviewGeometryShader(struct ShaderProgramD3D11* prg) {
+    if (prg->multiview_geometry_shader) {
+        return true;
+    }
+    if (prg->multiview_geometry_shader_tried) {
+        return false;
+    }
+    prg->multiview_geometry_shader_tried = true;
+
+    const std::string multiviewShader = MakeMultiviewGeometryShader(prg->multiview_shader_source);
+#if DEBUG_D3D
+    const UINT compileFlags = D3DCOMPILE_DEBUG;
+#else
+    const UINT compileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
+#endif
+    ComPtr<ID3DBlob> gs;
+    ComPtr<ID3DBlob> errorBlob;
+    const HRESULT compileHr =
+        mD3dCompile(multiviewShader.data(), multiviewShader.size(), nullptr, nullptr, nullptr, "GSMain", "gs_4_0",
+                    compileFlags, 0, gs.GetAddressOf(), errorBlob.GetAddressOf());
+    if (FAILED(compileHr)) {
+        const char* err = errorBlob ? static_cast<const char*>(errorBlob->GetBufferPointer()) : "Unknown error";
+        SPDLOG_ERROR("[VR] D3D11 multiview geometry shader failed for combiner {:x}/{:x}: {}", prg->shader_id0,
+                     prg->shader_id1, err);
+        prg->multiview_shader_source.clear();
+        prg->multiview_shader_source.shrink_to_fit();
+        return false;
+    }
+
+    const HRESULT createHr = mDevice->CreateGeometryShader(gs->GetBufferPointer(), gs->GetBufferSize(), nullptr,
+                                                           prg->multiview_geometry_shader.GetAddressOf());
+    prg->multiview_shader_source.clear();
+    prg->multiview_shader_source.shrink_to_fit();
+    if (FAILED(createHr)) {
+        SPDLOG_ERROR("[VR] D3D11 could not create multiview geometry shader for combiner {:x}/{:x} (0x{:08x})",
+                     prg->shader_id0, prg->shader_id1, (uint32_t)createHr);
+        return false;
+    }
+    return true;
 }
 
 struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shader_id0, uint64_t shader_id1) {
@@ -495,6 +585,9 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
                                               prg->vertex_shader.GetAddressOf()));
     ThrowIfFailed(mDevice->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr,
                                              prg->pixel_shader.GetAddressOf()));
+    prg->multiview_geometry_shader.Reset();
+    prg->multiview_geometry_shader_tried = false;
+    prg->multiview_shader_source = std::move(shader);
 
     // Input Layout
 
@@ -741,66 +834,116 @@ void GfxRenderingAPIDX11::SetUseAlpha(bool use_alpha) {
 }
 
 void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
-
-    if (mLastDepthTest != mCurrentDepthTest || mLastDepthMask != mCurrentDepthMask) {
-        mLastDepthTest = mCurrentDepthTest;
-        mLastDepthMask = mCurrentDepthMask;
-
-        mDepthStencilState.Reset();
-
-        D3D11_DEPTH_STENCIL_DESC depth_stencil_desc;
-        ZeroMemory(&depth_stencil_desc, sizeof(D3D11_DEPTH_STENCIL_DESC));
-
-        depth_stencil_desc.DepthEnable = mCurrentDepthTest || mCurrentDepthMask;
-        depth_stencil_desc.DepthWriteMask =
-            mCurrentDepthMask ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
-        depth_stencil_desc.DepthFunc = mCurrentDepthTest
-                                           ? (mCurrentZmodeDecal ? D3D11_COMPARISON_LESS_EQUAL : D3D11_COMPARISON_LESS)
-                                           : D3D11_COMPARISON_ALWAYS;
-        depth_stencil_desc.StencilEnable = false;
-
-        ThrowIfFailed(mDevice->CreateDepthStencilState(&depth_stencil_desc, mDepthStencilState.GetAddressOf()));
-        mContext->OMSetDepthStencilState(mDepthStencilState.Get(), 0);
+    const bool stateObjectCacheEnabled =
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gVrD3D11StateCache", 1) != 0;
+    if (mStateObjectCacheEnabled != stateObjectCacheEnabled) {
+        mStateObjectCacheEnabled = stateObjectCacheEnabled;
+        mBoundDepthStencilStateKey = 0xFFu;
+        mBoundRasterizerStateKey = ~uint64_t{ 0 };
+        mUncachedDepthStencilState.Reset();
+        mUncachedRasterizerState.Reset();
     }
 
-    if (mLastZmodeDecal != mCurrentZmodeDecal) {
-        mLastZmodeDecal = mCurrentZmodeDecal;
-
-        mRasterizerState.Reset();
-
-        D3D11_RASTERIZER_DESC rasterizer_desc;
-        ZeroMemory(&rasterizer_desc, sizeof(D3D11_RASTERIZER_DESC));
-
-        rasterizer_desc.FillMode = D3D11_FILL_SOLID;
-        rasterizer_desc.CullMode = D3D11_CULL_NONE;
-        rasterizer_desc.FrontCounterClockwise = true;
-        rasterizer_desc.DepthBias = 0;
-        // SSDB = SlopeScaledDepthBias 120 leads to -2 at 240p which is the same as N64 mode which has very little
-        // fighting
-        const int n64modeFactor = 120;
-        const int noVanishFactor = 100;
-        float SSDB = -2;
-
-        switch (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_Z_FIGHTING_MODE, 0)) {
-            case 1: // scaled z-fighting (N64 mode like)
-                SSDB = -1.0f * (float)mRenderTargetHeight / n64modeFactor;
-                break;
-            case 2: // no vanishing paths
-                SSDB = -1.0f * (float)mRenderTargetHeight / noVanishFactor;
-                break;
-            case 0: // disabled
-            default:
-                SSDB = -2;
+    // Depth/stencil has only four independent booleans. Normalize decal when depth testing is off
+    // because it cannot affect DepthFunc, producing at most 16 immutable cached objects.
+    const uint8_t depthStencilKey = (mCurrentDepthTest ? 0x1u : 0u) | (mCurrentDepthMask ? 0x2u : 0u) |
+                                    (mCurrentDepthTest && mCurrentZmodeDecal ? 0x4u : 0u) |
+                                    (mVrVisibilityMaskTarget ? 0x8u : 0u);
+    if (mBoundDepthStencilStateKey != depthStencilKey) {
+        auto& state = stateObjectCacheEnabled ? mDepthStencilStateCache[depthStencilKey] : mUncachedDepthStencilState;
+        if (!stateObjectCacheEnabled) {
+            state.Reset();
         }
-        rasterizer_desc.SlopeScaledDepthBias = mCurrentZmodeDecal ? SSDB : 0.0f;
-        rasterizer_desc.DepthBiasClamp = 0.0f;
-        rasterizer_desc.DepthClipEnable = false;
-        rasterizer_desc.ScissorEnable = true;
-        rasterizer_desc.MultisampleEnable = false;
-        rasterizer_desc.AntialiasedLineEnable = false;
+        if (!state) {
+            D3D11_DEPTH_STENCIL_DESC depth_stencil_desc;
+            ZeroMemory(&depth_stencil_desc, sizeof(D3D11_DEPTH_STENCIL_DESC));
 
-        ThrowIfFailed(mDevice->CreateRasterizerState(&rasterizer_desc, mRasterizerState.GetAddressOf()));
-        mContext->RSSetState(mRasterizerState.Get());
+            depth_stencil_desc.DepthEnable = mCurrentDepthTest || mCurrentDepthMask;
+            depth_stencil_desc.DepthWriteMask =
+                mCurrentDepthMask ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
+            depth_stencil_desc.DepthFunc =
+                mCurrentDepthTest
+                    ? (mCurrentZmodeDecal ? D3D11_COMPARISON_LESS_EQUAL : D3D11_COMPARISON_LESS)
+                    : D3D11_COMPARISON_ALWAYS;
+            depth_stencil_desc.StencilEnable = mVrVisibilityMaskTarget;
+            if (mVrVisibilityMaskTarget) {
+                depth_stencil_desc.StencilReadMask = D3D11_DEFAULT_STENCIL_READ_MASK;
+                depth_stencil_desc.StencilWriteMask = 0;
+                depth_stencil_desc.FrontFace.StencilFailOp = D3D11_STENCIL_OP_KEEP;
+                depth_stencil_desc.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+                depth_stencil_desc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_KEEP;
+                depth_stencil_desc.FrontFace.StencilFunc = D3D11_COMPARISON_EQUAL;
+                depth_stencil_desc.BackFace = depth_stencil_desc.FrontFace;
+            }
+
+            ThrowIfFailed(mDevice->CreateDepthStencilState(&depth_stencil_desc, state.GetAddressOf()));
+        }
+        mContext->OMSetDepthStencilState(state.Get(), 0);
+        mBoundDepthStencilStateKey = depthStencilKey;
+    }
+
+    // Slope bias varies only for decal draws, by the selected z-fighting mode and target height.
+    // Those values form a stable key, so eye/HUD/framebuffer transitions reuse their prior state.
+    uint32_t zFightingMode = 0;
+    if (mCurrentZmodeDecal) {
+        const int configuredMode =
+            Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_Z_FIGHTING_MODE, 0);
+        zFightingMode = configuredMode == 1 ? 1u : (configuredMode == 2 ? 2u : 0u);
+    }
+    const uint32_t biasHeight = mCurrentZmodeDecal && zFightingMode != 0 ? static_cast<uint32_t>(mRenderTargetHeight)
+                                                                        : 0u;
+    const uint64_t rasterizerKey = (mCurrentZmodeDecal ? 0x1ull : 0ull) | (uint64_t{ zFightingMode } << 1) |
+                                   (uint64_t{ biasHeight } << 3);
+    if (mBoundRasterizerStateKey != rasterizerKey) {
+        // Target height is part of the bias calculation, so repeated resizes could otherwise retain
+        // an unbounded number of immutable states. The context owns a reference to the currently
+        // bound state, making it safe to discard old cache entries before binding the replacement.
+        constexpr size_t kMaxRasterizerStateCacheSize = 32;
+        if (stateObjectCacheEnabled && !mRasterizerStateCache.contains(rasterizerKey) &&
+            mRasterizerStateCache.size() >= kMaxRasterizerStateCacheSize) {
+            mRasterizerStateCache.clear();
+            mBoundRasterizerStateKey = ~uint64_t{ 0 };
+        }
+        auto& state = stateObjectCacheEnabled ? mRasterizerStateCache[rasterizerKey] : mUncachedRasterizerState;
+        if (!stateObjectCacheEnabled) {
+            state.Reset();
+        }
+        if (!state) {
+            D3D11_RASTERIZER_DESC rasterizer_desc;
+            ZeroMemory(&rasterizer_desc, sizeof(D3D11_RASTERIZER_DESC));
+
+            rasterizer_desc.FillMode = D3D11_FILL_SOLID;
+            rasterizer_desc.CullMode = D3D11_CULL_NONE;
+            rasterizer_desc.FrontCounterClockwise = true;
+            rasterizer_desc.DepthBias = 0;
+            // SSDB = SlopeScaledDepthBias 120 leads to -2 at 240p which is the same as N64 mode which has very little
+            // fighting
+            const int n64modeFactor = 120;
+            const int noVanishFactor = 100;
+            float SSDB = -2;
+
+            switch (zFightingMode) {
+                case 1: // scaled z-fighting (N64 mode like)
+                    SSDB = -1.0f * (float)mRenderTargetHeight / n64modeFactor;
+                    break;
+                case 2: // no vanishing paths
+                    SSDB = -1.0f * (float)mRenderTargetHeight / noVanishFactor;
+                    break;
+                case 0: // disabled
+                default:
+                    SSDB = -2;
+            }
+            rasterizer_desc.SlopeScaledDepthBias = mCurrentZmodeDecal ? SSDB : 0.0f;
+            rasterizer_desc.DepthBiasClamp = 0.0f;
+            rasterizer_desc.DepthClipEnable = false;
+            rasterizer_desc.ScissorEnable = true;
+            rasterizer_desc.MultisampleEnable = false;
+            rasterizer_desc.AntialiasedLineEnable = false;
+
+            ThrowIfFailed(mDevice->CreateRasterizerState(&rasterizer_desc, state.GetAddressOf()));
+        }
+        mContext->RSSetState(state.Get());
+        mBoundRasterizerStateKey = rasterizerKey;
     }
 
     bool textures_changed = false;
@@ -888,6 +1031,54 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         mContext->IASetInputLayout(mShaderProgram->input_layout.Get());
         mContext->VSSetShader(mShaderProgram->vertex_shader.Get(), 0, 0);
         mContext->PSSetShader(mShaderProgram->pixel_shader.Get(), 0, 0);
+    }
+
+    // The same combiner can draw first into EyeArray and then into an ordinary HUD/offscreen
+    // target. Track the geometry stage independently from the VS/PS program cache so that switch
+    // binds (and, critically, unbinds) the layered shader even when the combiner did not change.
+    if (mMultiviewTarget && !EnsureMultiviewGeometryShader(mShaderProgram)) {
+        // Never draw a center-eye image into only one layer. Hardware support is checked before
+        // EyeArray creation, so reaching this means shader generation/compilation failed and was
+        // already logged once for this program.
+        return;
+    }
+    ID3D11GeometryShader* geometryShader = mMultiviewTarget ? mShaderProgram->multiview_geometry_shader.Get() : nullptr;
+    if (!mGeometryShaderStateKnown || mLastGeometryShader != geometryShader) {
+        mContext->GSSetShader(geometryShader, nullptr, 0);
+        mLastGeometryShader = geometryShader;
+        mGeometryShaderStateKnown = true;
+    }
+
+    if (mMultiviewTarget) {
+        if (!mPerVrEyeCb) {
+            D3D11_BUFFER_DESC eyeBufferDesc = {};
+            eyeBufferDesc.Usage = D3D11_USAGE_DYNAMIC;
+            eyeBufferDesc.ByteWidth = sizeof(PerVrEyeCB);
+            eyeBufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            eyeBufferDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+            const HRESULT createEyeBuffer = mDevice->CreateBuffer(&eyeBufferDesc, nullptr, mPerVrEyeCb.GetAddressOf());
+            if (FAILED(createEyeBuffer)) {
+                SPDLOG_ERROR("[VR] D3D11 could not create the eye-matrix constant buffer (0x{:08x})",
+                             (uint32_t)createEyeBuffer);
+                return;
+            }
+            mVrEyeGeneration = UINT32_MAX;
+        }
+        uint32_t generation = 0;
+        const float* eyeMtx = vr_get_multiview_eye_matrices(&generation);
+        if (generation != mVrEyeGeneration) {
+            memcpy(mPerVrEyeCbData.eye_mtx, eyeMtx, sizeof(mPerVrEyeCbData.eye_mtx));
+            D3D11_MAPPED_SUBRESOURCE eyeMs = {};
+            ThrowIfFailed(mContext->Map(mPerVrEyeCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &eyeMs));
+            memcpy(eyeMs.pData, &mPerVrEyeCbData, sizeof(mPerVrEyeCbData));
+            mContext->Unmap(mPerVrEyeCb.Get(), 0);
+            mVrEyeGeneration = generation;
+        }
+        if (!mVrEyeCbBound) {
+            ID3D11Buffer* eyeBuffer = mPerVrEyeCb.Get();
+            mContext->GSSetConstantBuffers(3, 1, &eyeBuffer);
+            mVrEyeCbBound = true;
+        }
     }
 
     // Checked per draw, not per program switch: the same program draws into the eyes and the
@@ -1026,7 +1217,7 @@ void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width,
 
 void GfxRenderingAPIDX11::StartDrawToFramebuffer(int fb_id, float noise_scale) {
     FramebufferDX11& fb = mFrameBuffers[fb_id];
-    mRenderTargetHeight = mTextures[fb.texture_id].height;
+    SetExternalRenderTarget((int32_t)mTextures[fb.texture_id].height, false);
 
     mContext->OMSetRenderTargets(1, fb.render_target_view.GetAddressOf(),
                                  fb.has_depth_buffer ? fb.depth_stencil_view.Get() : nullptr);

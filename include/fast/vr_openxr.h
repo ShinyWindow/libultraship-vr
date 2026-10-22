@@ -22,6 +22,9 @@ bool vr_backend_supported(int window_backend);
 bool vr_probe_required_adapter(int window_backend, uint64_t* luid);
 bool vr_init();
 void vr_shutdown();
+// Final process teardown. Releases graphics resources but leaves the small backend wrapper for the
+// operating system, avoiding heap destruction after the renderer/runtime have begun static exit.
+void vr_shutdown_final();
 // Latch a pending VR<->flat mode request (CVar gVrEnabled). Call ONLY at a game-tick boundary,
 // before the tick's display list is built. Lazily creates the OpenXR session on first enable.
 void vr_apply_mode_request();
@@ -46,7 +49,7 @@ bool vr_should_present_desktop();
 // by the VR Settings performance section; purely diagnostic.
 struct VrFrameStats {
     float wait_ms;    // blocked inside xrWaitFrame — this is spare headroom, higher is better
-    float eyes_ms;    // both eye display-list passes
+    float eyes_ms;    // stereo eye rendering (one single-pass traversal or two ordinary passes)
     float hud_ms;     // HUD quad pass
     float desktop_ms; // companion window: ImGui + mirror blit + Present
     float frame_ms;   // whole DrawAndRunGraphicsCommands
@@ -65,13 +68,16 @@ void vr_get_frame_stats(struct VrFrameStats* out);
 void vr_begin_eye(int eye);
 void vr_end_eye(int eye);
 
-// Single-pass stereo (multiview, GLES). When vr_multiview_enabled(), the frame loop draws the eyes
+// Single-pass stereo (multiview). When vr_multiview_enabled(), the frame loop draws the eyes
 // with ONE interpreter run between vr_begin_stereo / vr_end_stereo instead of two eye passes. The
 // run sees eye kCenterEye (2): a culling camera whose view contains both eyes'; the renderer's
 // multiview programs move each vertex into each eye with vr_get_multiview_eye_matrices (two
 // row-major 4x4s, clip_eye = clip_center * M; identity while eye-welded 2D is drawn). The
 // generation changes whenever the returned matrices do.
 bool vr_multiview_enabled();
+// True once the active graphics backend has uploaded at least one valid OpenXR hidden-area mask.
+// False covers disabled, unsupported, not-yet-initialized, and all safe fallback paths.
+bool vr_visibility_mask_enabled();
 void vr_begin_stereo();
 void vr_end_stereo();
 bool vr_is_multiview_pass();
@@ -88,11 +94,21 @@ void vr_get_fog_ndc_z_params(float* a, float* b);
 
 // State queries
 bool vr_is_initialized();
+// True only while the OpenXR session is focused and accepting headset/controller input.
+bool vr_is_session_focused();
 int vr_get_current_eye();
 void vr_get_recommended_resolution(uint32_t* width, uint32_t* height);
 // Headset display refresh rate in Hz (e.g. 72/90/120). Used to pace the game's fixed-timestep
 // logic via the interpolation system. Returns a sane default before the first frame is located.
 uint32_t vr_get_refresh_rate();
+// Time spent blocked in xrWaitFrame for the current frame. This is compositor pacing headroom,
+// not active CPU rendering work.
+float vr_get_last_wait_ms();
+void vr_gpu_timing_frame_begin();
+void vr_gpu_timing_phase_begin(int phase);
+void vr_gpu_timing_phase_end(int phase);
+void vr_gpu_timing_frame_end();
+bool vr_gpu_timing_get_latest(float* eyes_ms, float* hud_ms, float* desktop_ms, float* total_ms);
 // Display refresh rates the headset offers (XR_FB_display_refresh_rate: Meta's runtimes), read at
 // session start; 0 where the runtime doesn't offer a choice. gVrRefreshRate (Hz, 0 = the headset's
 // default) picks one of them.
@@ -212,6 +228,11 @@ void vr_begin_hud();
 void vr_end_hud();
 bool vr_is_rendering_hud();
 bool vr_is_rendering_screen();
+// Replays only physical-key HUD rectangles into the active stereo eye pass. Their world transform
+// is also used by grabbing, so the rendered key and its target cannot diverge.
+bool vr_begin_key_world_pass();
+void vr_end_key_world_pass();
+bool vr_is_key_world_pass();
 
 // Text panel: the message system's display list (text boxes, ocarina staff) on its own quad that
 // soft-follows in front of the player in real metres. commands NULL = no text box showing (panel
@@ -238,6 +259,8 @@ struct VrMenuPointer {
     int hand;
 };
 bool vr_menu_panel_active();
+bool vr_menu_interactive();
+void vr_set_notifications_visible(bool visible);
 // False on standalone headsets (Android): VR can't be switched off there (no flat screen exists);
 // the VR Mode checkbox and F9 are hidden / ignored, and doffing never drops to flat.
 bool vr_can_disable();
@@ -260,6 +283,7 @@ bool vr_hud_tri(const float ndc_xy[6], float out_scale_offset[4]);
 // Link's age, for the Adult / Child wrist HUD settings profile (vr_hud_settings.h).
 void vr_set_hud_child(bool child);
 bool vr_get_hud_child();
+bool vr_get_hud_element_hand_distance(int hand, int element, float* distance_m);
 // World-anchored HUD quad (world-space pause): see VR_SetHudWorldPanel.
 void vr_set_hud_world_panel(bool enabled, const float center[3], float yaw, float width, float height);
 // Texture rectangles in stereo passes (world-space file select): see VR_SetRectWorldPanel. Plain

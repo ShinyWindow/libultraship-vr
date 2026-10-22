@@ -49,6 +49,10 @@ void VR_SetHudChild(int32_t child) {
     vr_set_hud_child(child != 0);
 }
 
+bool VR_GetHudElementHandDistance(int32_t hand, int32_t element, float* distanceMeters) {
+    return vr_get_hud_element_hand_distance(hand, element, distanceMeters);
+}
+
 void VR_SetHudWorldPanel(int32_t enabled, const float center[3], float yaw, float width, float height) {
     vr_set_hud_world_panel(enabled != 0, center, yaw, width, height);
 }
@@ -75,6 +79,10 @@ void VR_SetLinkEyeHeight(float units) {
 
 void VR_SetViewFade(float fade) {
     vr_set_view_fade(fade);
+}
+
+void VR_SetNotificationsVisible(bool visible) {
+    vr_set_notifications_visible(visible);
 }
 
 void VR_SetCameraYaw(int16_t yaw_binang) {

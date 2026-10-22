@@ -43,6 +43,7 @@ enum class Target : int { Eye0, Eye1, Hud, Text, Screen, Menu, Beam, EyeArray, C
 
 // Desktop mirror slots: 0 = left eye, 1 = HUD, 2 = text panel, 3 = flat-screen panel.
 enum MirrorSlot : int { kMirrorEye = 0, kMirrorHud = 1, kMirrorText = 2, kMirrorScreen = 3, kMirrorCount = 4 };
+enum class TimingPhase : int { Eyes = 0, Hud = 1, Desktop = 2, Count = 3 };
 
 struct Rect {
     int32_t x, y, w, h; // pixels, TOP-LEFT origin of the picture
@@ -105,6 +106,30 @@ class Backend {
     virtual bool SupportsMultiview() const {
         return false;
     }
+
+    // OpenXR hidden-area mask. The core enables this only when XR_KHR_visibility_mask supplies a
+    // valid hidden-triangle mesh. Backends that support it allocate stencil-capable eye depth
+    // targets, then receive per-eye vertices already projected to clip-space XY. Ordinary
+    // backends retain the full-frame path through these default implementations.
+    virtual bool ConfigureVisibilityMask(bool enable) {
+        return !enable;
+    }
+    virtual void SetVisibilityMask(uint32_t eye, const float* clipXy, uint32_t vertexCount,
+                                   const uint32_t* indices, uint32_t indexCount) {
+    }
+    // Per-pass eye policy (bit 0 = left, bit 1 = right). The core excludes the left eye when it
+    // will be copied to the desktop companion, while a layered pass can still mask the right eye.
+    virtual void SetVisibilityMaskEyesForPass(uint32_t eyeMask) {
+    }
+    virtual bool VisibilityMaskActive() const {
+        return false;
+    }
+
+    virtual void TimingFrameBegin() {}
+    virtual void TimingPhaseBegin(TimingPhase) {}
+    virtual void TimingPhaseEnd(TimingPhase) {}
+    virtual void TimingFrameEnd() {}
+    virtual bool TimingGetLatest(float*, float*, float*, float*) { return false; }
 
     virtual void Shutdown() = 0;
 };

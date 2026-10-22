@@ -338,6 +338,17 @@ void Fast3dGui::CalculateGameViewport() {
     mainPos.y -= mTemporaryWindowPos.y;
     ImVec2 size = ImGui::GetContentRegionAvail();
     const auto interpreter = mInterpreter.lock().get();
+
+    // The headset menu/notification panel has its own 1600x1000 ImGui canvas. It is not a game
+    // viewport: copying that size into the interpreter makes the game and HUD briefly lay
+    // themselves out for the panel whenever ImGui opens. VR binds the real eye/screen dimensions
+    // immediately before each render pass, so preserve them here and create only the placeholder
+    // window that VrMenuRenderPanel filters out of the panel draw data.
+    if (mVrPanelFrame) {
+        ImGui::End();
+        return;
+    }
+
     interpreter->mCurDimensions.width = (uint32_t)(size.x * mInterpreter.lock()->mCurDimensions.internal_mul);
     interpreter->mCurDimensions.height = (uint32_t)(size.y * mInterpreter.lock()->mCurDimensions.internal_mul);
     interpreter->mGameWindowViewport.x = (int16_t)mainPos.x;

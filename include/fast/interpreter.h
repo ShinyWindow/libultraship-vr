@@ -350,6 +350,9 @@ struct ColorCombiner {
     bool usedTextures[2];
     struct ShaderProgram* prg[16];
     uint8_t shader_input_mapping[2][7];
+    uint8_t numInputs[16]{};
+    bool shaderUsedTextures[16][2]{};
+    bool shaderInfoValid[16]{};
 };
 
 struct RenderingState {
@@ -424,6 +427,8 @@ class Interpreter {
     ColorCombiner* LookupOrCreateColorCombiner(const ColorCombinerKey& key);
     void ShaderCacheClear();
     void TextureCacheClear();
+    void* GetCachedResourceRawPointer(const char* path);
+    void* GetCachedResourceRawPointer(uint64_t hash);
     bool TextureCacheLookup(int i, const TextureCacheKey& key);
     void TextureCacheDelete(const uint8_t* origAddr);
     void ImportTextureRgba16(int tile, bool importReplacement);
@@ -547,6 +552,10 @@ class Interpreter {
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> mGetPixelDepthCached; // get_pixel_depth_cached;
     std::map<std::string, MaskedTextureEntry, std::less<>> mMaskedTextures;
     std::unordered_map<uintptr_t, int> mFbTextures; // CPU addr -> GPU FB id
+    std::unordered_map<const char*, void*> mVrPathResourceCache;
+    std::unordered_map<uint64_t, void*> mVrHashResourceCache;
+    GfxClipParameters mFrameClipParameters{};
+    bool mVrInterpreterCacheEnabled{};
 
     const std::unordered_map<Mtx*, MtxF>* mCurMtxReplacements;
     bool mMarkerOn; // This was originally a debug feature. Now it seems to control s2dex?

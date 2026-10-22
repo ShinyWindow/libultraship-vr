@@ -443,7 +443,8 @@ class OpenGLBackend final : public Backend {
 #ifndef USE_OPENGLES
         if (mHasCopyImage) {
             // SRGB8_ALPHA8 and RGBA8 share a view class: a raw copy, bytes verbatim.
-            glCopyImageSubData(sc.color[image], GL_TEXTURE_2D, 0, 0, 0, 0, m.tex, GL_TEXTURE_2D, 0, 0, 0, 0,
+            glCopyImageSubData(sc.color[image], GL_TEXTURE_2D, 0, 0, 0, 0,
+                               m.tex, GL_TEXTURE_2D, 0, 0, 0, 0,
                                (GLsizei)sc.width, (GLsizei)sc.height, 1);
             return;
         }
@@ -457,7 +458,8 @@ class OpenGLBackend final : public Backend {
         glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m.tex, 0);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, sc.multiview ? sc.layer0Fbo[image] : sc.fbo[image]);
         glDisable(GL_SCISSOR_TEST);
-        glBlitFramebuffer(0, 0, (GLint)sc.width, (GLint)sc.height, 0, 0, (GLint)sc.width, (GLint)sc.height,
+        glBlitFramebuffer(0, 0, (GLint)sc.width, (GLint)sc.height,
+                          0, 0, (GLint)sc.width, (GLint)sc.height,
                           GL_COLOR_BUFFER_BIT, GL_NEAREST);
     }
 

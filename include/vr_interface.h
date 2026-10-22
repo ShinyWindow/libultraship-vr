@@ -49,11 +49,14 @@ void VR_SetTextPanelLayout(float widthM, float distanceM, float heightM);
 #define VR_HUD_EL_BTN_START 16    // pause only
 #define VR_HUD_EL_MOUNT 17        // Epona's carrots / horseback archery score
 #define VR_HUD_EL_MINIMAP 18
-#define VR_HUD_EL_COUNT 19
+#define VR_HUD_EL_PHYSICAL_KEYS 19 // physical-key inventory module below the non-dominant wrist HUD
+#define VR_HUD_EL_PHYSICAL_BOSS_KEY 20 // boss-key icon beside the physical small-key module
+#define VR_HUD_EL_COUNT 21
 #define VR_HUD_MARKER(element, alpha) (0x100u | ((unsigned)(element) & 0xFFu) | (((unsigned)(alpha) & 0xFFu) << 16))
 // Link's age, pushed by the game with the HUD each tick: the wrist HUD has separate Adult and
 // Child layout profiles (fast/vr_hud_settings.h).
 void VR_SetHudChild(int32_t child);
+bool VR_GetHudElementHandDistance(int32_t hand, int32_t element, float* distanceMeters);
 
 // World-anchored HUD for the world-space pause menu: while enabled, the HUD (vitals, buttons with
 // their Return / Save / Decide labels, the equip fly-in) is drawn at its TV positions on one quad in the
@@ -100,6 +103,9 @@ void VR_SetLinkEyeHeight(float units);
 // Alyx-style comfort fade: 0 = clear, 1 = world layer black (menus/HUD unaffected). The game sets
 // this each tick from how far the player's physical head sits beyond solid geometry.
 void VR_SetViewFade(float fade);
+// Makes the existing ImGui notification windows available on a passive headset panel. This does
+// not open the interactive SoH menu or consume controller input.
+void VR_SetNotificationsVisible(bool visible);
 // Third person: the game camera's facing (binang yaw) becomes the playspace's base orientation,
 // so looking straight ahead in the headset looks where the stock camera looks (cutscenes too).
 void VR_SetCameraYaw(int16_t yaw_binang);

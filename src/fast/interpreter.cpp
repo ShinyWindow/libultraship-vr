@@ -469,6 +469,30 @@ void Interpreter::TextureCacheClear() {
     mTextureCache.map.reserve(TEXTURE_CACHE_MAX_SIZE);
     // Null rendering-state pointers — they pointed into map nodes that are now freed.
     std::fill(std::begin(mRenderingState.mTextures), std::end(mRenderingState.mTextures), nullptr);
+    mVrPathResourceCache.clear();
+    mVrHashResourceCache.clear();
+}
+
+void* Interpreter::GetCachedResourceRawPointer(const char* path) {
+    if (!mVrInterpreterCacheEnabled) {
+        return Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer(path);
+    }
+    auto [it, inserted] = mVrPathResourceCache.try_emplace(path, nullptr);
+    if (inserted) {
+        it->second = Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer(path);
+    }
+    return it->second;
+}
+
+void* Interpreter::GetCachedResourceRawPointer(uint64_t hash) {
+    if (!mVrInterpreterCacheEnabled) {
+        return Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer(hash);
+    }
+    auto [it, inserted] = mVrHashResourceCache.try_emplace(hash, nullptr);
+    if (inserted) {
+        it->second = Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer(hash);
+    }
+    return it->second;
 }
 
 void Interpreter::ShaderCacheClear() {
@@ -2139,10 +2163,18 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         mRapi->SetUseAlpha(use_alpha);
         mRenderingState.alpha_blend = use_alpha;
     }
-    uint8_t numInputs;
-    bool usedTextures[2];
-
-    mRapi->ShaderGetInfo(prg, &numInputs, usedTextures);
+    uint8_t uncachedNumInputs = 0;
+    bool uncachedUsedTextures[2]{};
+    if (mVrInterpreterCacheEnabled) {
+        if (!comb->shaderInfoValid[tm]) {
+            mRapi->ShaderGetInfo(prg, &comb->numInputs[tm], comb->shaderUsedTextures[tm]);
+            comb->shaderInfoValid[tm] = true;
+        }
+    } else {
+        mRapi->ShaderGetInfo(prg, &uncachedNumInputs, uncachedUsedTextures);
+    }
+    const uint8_t numInputs = mVrInterpreterCacheEnabled ? comb->numInputs[tm] : uncachedNumInputs;
+    const bool* usedTextures = mVrInterpreterCacheEnabled ? comb->shaderUsedTextures[tm] : uncachedUsedTextures;
 
     // SOH [VR] Multiview pass: world geometry goes out in the center camera's clip space and the GPU
     // moves it into each eye; a rect that covers the eye's own view (texrects, fills: the per-eye
@@ -2155,7 +2187,10 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         }
     }
 
-    struct GfxClipParameters clip_parameters = mRapi->GetClipParameters();
+    const GfxClipParameters uncachedClipParameters =
+        mVrInterpreterCacheEnabled ? GfxClipParameters{} : mRapi->GetClipParameters();
+    const GfxClipParameters& clip_parameters =
+        mVrInterpreterCacheEnabled ? mFrameClipParameters : uncachedClipParameters;
 
     for (int i = 0; i < 3; i++) {
         float z = v_arr[i]->z, w = v_arr[i]->w;
@@ -2955,18 +2990,25 @@ void Interpreter::GfxDrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_
 
     struct XYWidthHeight viewport_saved = mRdp->viewport;
     uint32_t geometry_mode_saved = mRsp->geometry_mode;
+    uint32_t other_mode_l_saved = mRdp->other_mode_l;
 
     AdjustVIewportOrScissor(&default_viewport);
 
     mRdp->viewport = default_viewport;
     mRdp->viewport_or_scissor_changed = true;
     mRsp->geometry_mode = 0;
+    // Physical key cards are real eye-pass quads. Test them against the world's existing depth so
+    // the rendered hand can pass in front, but do not write depth and mask later transparent pixels.
+    if (mVrRectWorldMapped && vr_is_key_world_pass()) {
+        mRdp->other_mode_l = (mRdp->other_mode_l | Z_CMP) & ~Z_UPD;
+    }
 
     GfxSpTri1(MAX_VERTICES + 0, MAX_VERTICES + 1, MAX_VERTICES + 3, true);
     GfxSpTri1(MAX_VERTICES + 1, MAX_VERTICES + 2, MAX_VERTICES + 3, true);
     mVrRectWorldMapped = false;
 
     mRsp->geometry_mode = geometry_mode_saved;
+    mRdp->other_mode_l = other_mode_l_saved;
     mRdp->viewport = viewport_saved;
     mRdp->viewport_or_scissor_changed = true;
 
@@ -3729,7 +3771,7 @@ bool gfx_vtx_hash_handler_custom(F3DGfx** cmd0) {
         gfx->GfxSpVertex(C0(12, 8), C0(1, 7) - C0(12, 8), (F3DVtx*)offset);
         (*cmd0)++;
     } else {
-        F3DVtx* vtx = (F3DVtx*)Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer(hash);
+        F3DVtx* vtx = (F3DVtx*)gfx->GetCachedResourceRawPointer(hash);
 
         if (vtx != NULL) {
             vtx = (F3DVtx*)((char*)vtx + offset);
@@ -3756,8 +3798,7 @@ bool gfx_vtx_otr_filepath_handler_custom(F3DGfx** cmd0) {
     size_t vtxCnt = cmd->words.w0;
     size_t vtxIdxOff = cmd->words.w1 >> 16;
     size_t vtxDataOff = cmd->words.w1 & 0xFFFF;
-    F3DVtx* vtx =
-        (F3DVtx*)Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer((const char*)fileName);
+    F3DVtx* vtx = (F3DVtx*)gfx->GetCachedResourceRawPointer((const char*)fileName);
     vtx += vtxDataOff;
 
     gfx->GfxSpVertex(vtxCnt, vtxIdxOff, vtx);
@@ -3765,10 +3806,10 @@ bool gfx_vtx_otr_filepath_handler_custom(F3DGfx** cmd0) {
 }
 
 bool gfx_dl_otr_filepath_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
     char* fileName = (char*)cmd->words.w1;
-    F3DGfx* nDL =
-        (F3DGfx*)Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer((const char*)fileName);
+    F3DGfx* nDL = (F3DGfx*)gfx->GetCachedResourceRawPointer((const char*)fileName);
 
     if (C0(16, 1) == 0 && nDL != nullptr) {
         g_exec_stack.call(*cmd0, nDL);
@@ -3821,10 +3862,10 @@ bool gfx_dl_otr_hash_handler_custom(F3DGfx** cmd0) {
 
         uint64_t hash = ((uint64_t)(*cmd0)->words.w0 << 32) + (*cmd0)->words.w1;
 
-        F3DGfx* gfx = (F3DGfx*)Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer(hash);
+        F3DGfx* resolvedGfx = (F3DGfx*)sInstance->GetCachedResourceRawPointer(hash);
 
-        if (gfx != 0) {
-            g_exec_stack.call(cmd, gfx);
+        if (resolvedGfx != 0) {
+            g_exec_stack.call(cmd, resolvedGfx);
         }
     } else {
         Interpreter* gfx = sInstance;
@@ -5243,6 +5284,10 @@ void Interpreter::RunGuiOnly() {
 
 void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements) {
     SpReset();
+    mVrInterpreterCacheEnabled =
+        vr_is_initialized() &&
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gVrInterpreterCache", 1) != 0;
+    mFrameClipParameters = mRapi->GetClipParameters();
 
     mGetPixelDepthPending.clear();
     mGetPixelDepthCached.clear();
@@ -5438,7 +5483,11 @@ void Interpreter::ResetFrameBuffer() {
         vr_rebind_current_eye_target();
         return;
     }
-    mRapi->StartDrawToFramebuffer(0, (float)mCurDimensions.height / mNativeDimensions.height);
+    // Preserve the original flat-renderer target. With internal-resolution scaling or MSAA the
+    // game renders into mGameFb, not framebuffer 0; returning to 0 here sends the pause backdrop
+    // and menu to a target that the final window composite does not display.
+    mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0,
+                                  (float)mCurDimensions.height / mNativeDimensions.height);
 }
 
 void Interpreter::AdjustPixelDepthCoordinates(float& x, float& y) {

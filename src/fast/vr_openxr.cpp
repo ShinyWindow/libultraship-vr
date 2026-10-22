@@ -100,10 +100,15 @@ static float vr_hud_panel_f(int child, int hand, const char* field, float def);
 static constexpr float kWristPack = 0.5f;
 static constexpr float kWristCanvasW = 160.0f; // native px per hand canvas
 static bool vr_wrist_panel_pose(int hand, XrPosef* pose, float* mpu, float* w_units, float* h_units);
+static int vr_hud_el_hand(int el);
 static void vr_hud_grab_update();
 static void vr_draw_test_card(vrgfx::Target t, uint32_t image, uint32_t w, uint32_t h);
 static void vr_refresh_rate_init();
 static bool g_refresh_rate_retried = false; // one more rate query once frames are running
+// Live hand-model state pushed by the game. Keep it available to HUD contact testing so the
+// contact point can occupy the same calibrated, scaled hand that the player actually sees.
+static float g_hand_scale = 1.0f;
+static bool g_hand_mirror[2] = { false, false };
 
 // --------------------------------------------------------------------------
 // Internal state
@@ -157,7 +162,7 @@ static struct {
     float projection[3][4][4];
     float view[3][4][4];
 
-    // Single-pass stereo (multiview, GLES): both eyes in one two-layer swapchain (eye_swapchains[0]
+    // Single-pass stereo (multiview): both eyes in one two-layer swapchain (eye_swapchains[0]
     // holds it; [1] keeps only the size), drawn by ONE interpreter run from the center camera. The
     // GPU moves each vertex from the center camera's clip space into each eye's with mv_eye_mtx
     // (one 4x4 per layer); eye-welded 2D (texrects, fills) uses identity instead (mv_welded).
@@ -166,6 +171,19 @@ static struct {
     bool mv_welded;
     uint32_t mv_gen;     // bumped whenever the matrices the renderer should use change
     float mv_eye_mtx[2][16];
+
+    // Runtime-provided lens masks. OpenXR supplies vertices in each eye's z=-1 view plane; after
+    // xrLocateViews gives us that eye's current FOV, they are projected to clip-space XY and sent
+    // to the graphics leaf. The D3D11 leaf stamps hidden pixels into stencil before scene draws.
+    struct VisibilityMask {
+        std::vector<XrVector2f> vertices;
+        std::vector<uint32_t> indices;
+        std::vector<float> clip_xy;
+        XrFovf uploaded_fov;
+        bool dirty;
+        bool has_uploaded_fov;
+    } visibility_masks[2];
+    bool visibility_mask_configured;
 
     // Configuration
     float world_scale;       // N64 units per meter
@@ -245,8 +263,11 @@ static struct {
     XrSpace view_space;
     struct EyeSwapchain hud_swapchain;
     uint32_t hud_image_index;
-    void* hud_commands;
-    bool rendering_hud;
+      void* hud_commands;
+      bool rendering_hud;
+      bool key_world_pass;
+      bool key_world_saved_rect;
+      float key_world_saved_mtx[4][4];
 
     // Text panel: the message system (dialogue, signs, item text, the ocarina staff) on its own
     // quad that soft-follows in front of the player. Real metres in local_space, independent of
@@ -300,6 +321,11 @@ static struct {
     float hud_block[2][4]; // per hand canvas block, native px (x0, y0, x1, y1)
     bool hud_block_valid[2];
     float hud_block_alpha[2];
+    // Background rectangles inside each wrist crop. The left wrist may use a second, separate
+    // card for physical-key icons while both cards retain one rigid wrist transform.
+    float hud_back[2][3][4]; // main card, Small Key card, Boss Key card
+    bool hud_back_valid[2][3];
+    float hud_key_display_scale[2] = { 1.0f, 1.0f };
     // World-anchored HUD (world-space pause): game-world centre/yaw/size, converted per frame.
     bool hud_world;
     glm::vec3 hud_world_center;
@@ -367,6 +393,12 @@ static struct {
     // unavailable the feature is inert: user_present stays true and doffing changes nothing.
     bool user_presence_supported;
     bool user_present;
+
+    // XR_KHR_visibility_mask is enabled only when requested before instance creation. The function
+    // pointer belongs to that instance and is cleared when the instance is destroyed.
+    bool visibility_mask_supported;
+    bool visibility_mask_extension_enabled;
+    PFN_xrGetVisibilityMaskKHR get_visibility_mask;
 
     // Alyx-style in-wall view fade: when the player's physical head is inside geometry, the WORLD
     // layer fades toward black at the compositor (XR_KHR_composition_layer_color_scale_bias) —
@@ -785,6 +817,150 @@ static glm::vec3 vr_anchor_now() {
     return base;
 }
 
+static void vr_clear_visibility_mask(uint32_t eye) {
+    if (eye >= 2) {
+        return;
+    }
+    auto& mask = xr.visibility_masks[eye];
+    mask.vertices.clear();
+    mask.indices.clear();
+    mask.clip_xy.clear();
+    mask.dirty = true;
+    mask.has_uploaded_fov = false;
+}
+
+// XR_KHR_visibility_mask uses the two-call idiom for two arrays in one structure. Any malformed or
+// failed update disables that eye's mask: rendering extra pixels is always safer than hiding pixels
+// the player might be able to see.
+static bool vr_query_visibility_mask(uint32_t eye) {
+    if (eye >= 2 || !xr.visibility_mask_extension_enabled || xr.get_visibility_mask == nullptr ||
+        xr.session == XR_NULL_HANDLE) {
+        return false;
+    }
+
+    XrVisibilityMaskKHR sizes = { XR_TYPE_VISIBILITY_MASK_KHR };
+    XrResult result = xr.get_visibility_mask(xr.session, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, eye,
+                                             XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR, &sizes);
+    if (XR_FAILED(result)) {
+        xr_check(result, "xrGetVisibilityMaskKHR (sizes)");
+        vr_clear_visibility_mask(eye);
+        return false;
+    }
+    if (sizes.vertexCountOutput == 0 || sizes.indexCountOutput == 0) {
+        vr_clear_visibility_mask(eye);
+        spdlog::info("[VR] Hidden-area mask: runtime supplied no mesh for eye {}", eye);
+        return false;
+    }
+
+    auto& mask = xr.visibility_masks[eye];
+    mask.vertices.resize(sizes.vertexCountOutput);
+    mask.indices.resize(sizes.indexCountOutput);
+
+    bool fetched = false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        XrVisibilityMaskKHR data = { XR_TYPE_VISIBILITY_MASK_KHR };
+        data.vertexCapacityInput = (uint32_t)mask.vertices.size();
+        data.vertices = mask.vertices.data();
+        data.indexCapacityInput = (uint32_t)mask.indices.size();
+        data.indices = mask.indices.data();
+        result = xr.get_visibility_mask(xr.session, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, eye,
+                                        XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR, &data);
+        if (result == XR_ERROR_SIZE_INSUFFICIENT) {
+            if (data.vertexCountOutput == 0 || data.indexCountOutput == 0) {
+                break;
+            }
+            mask.vertices.resize(data.vertexCountOutput);
+            mask.indices.resize(data.indexCountOutput);
+            continue;
+        }
+        if (XR_FAILED(result)) {
+            xr_check(result, "xrGetVisibilityMaskKHR (mesh)");
+            break;
+        }
+        if (data.vertexCountOutput > mask.vertices.size() || data.indexCountOutput > mask.indices.size()) {
+            break;
+        }
+        mask.vertices.resize(data.vertexCountOutput);
+        mask.indices.resize(data.indexCountOutput);
+        fetched = true;
+        break;
+    }
+
+    if (!fetched || mask.vertices.empty() || mask.indices.empty() || mask.indices.size() % 3 != 0) {
+        spdlog::warn("[VR] Hidden-area mask eye {} was unavailable or malformed; rendering the full eye", eye);
+        vr_clear_visibility_mask(eye);
+        return false;
+    }
+    for (uint32_t index : mask.indices) {
+        if (index >= mask.vertices.size()) {
+            spdlog::warn("[VR] Hidden-area mask eye {} contains an invalid vertex index; rendering the full eye", eye);
+            vr_clear_visibility_mask(eye);
+            return false;
+        }
+    }
+
+    mask.clip_xy.resize(mask.vertices.size() * 2);
+    mask.dirty = true;
+    spdlog::info("[VR] Hidden-area mask eye {}: {} vertices, {} triangles", eye, mask.vertices.size(),
+                 mask.indices.size() / 3);
+    return true;
+}
+
+static bool vr_same_fov(const XrFovf& a, const XrFovf& b) {
+    return a.angleLeft == b.angleLeft && a.angleRight == b.angleRight && a.angleUp == b.angleUp &&
+           a.angleDown == b.angleDown;
+}
+
+static void vr_update_visibility_masks() {
+    if (!xr.visibility_mask_configured || !xr.gfx) {
+        return;
+    }
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        auto& mask = xr.visibility_masks[eye];
+        const XrFovf& fov = xr.views[eye].fov;
+        if (!mask.dirty && mask.has_uploaded_fov && vr_same_fov(mask.uploaded_fov, fov)) {
+            continue;
+        }
+        if (mask.vertices.empty() || mask.indices.empty()) {
+            xr.gfx->SetVisibilityMask(eye, nullptr, 0, nullptr, 0);
+            mask.dirty = false;
+            mask.uploaded_fov = fov;
+            mask.has_uploaded_fov = true;
+            continue;
+        }
+
+        const float(&projection)[4][4] = xr.projection[eye];
+        bool valid = true;
+        for (size_t i = 0; i < mask.vertices.size(); ++i) {
+            const float x = mask.vertices[i].x;
+            const float y = mask.vertices[i].y;
+            // OpenXR defines mask vertices on view-space z=-1 with w=1. The engine stores a
+            // row-vector projection, so clip = (x, y, -1, 1) * projection.
+            const float clipX = x * projection[0][0] + y * projection[1][0] - projection[2][0] + projection[3][0];
+            const float clipY = x * projection[0][1] + y * projection[1][1] - projection[2][1] + projection[3][1];
+            const float clipW = x * projection[0][3] + y * projection[1][3] - projection[2][3] + projection[3][3];
+            if (!std::isfinite(clipX) || !std::isfinite(clipY) || !std::isfinite(clipW) ||
+                std::fabs(clipW) < 1e-6f) {
+                valid = false;
+                break;
+            }
+            mask.clip_xy[i * 2 + 0] = clipX / clipW;
+            mask.clip_xy[i * 2 + 1] = clipY / clipW;
+        }
+
+        if (valid) {
+            xr.gfx->SetVisibilityMask(eye, mask.clip_xy.data(), (uint32_t)mask.vertices.size(), mask.indices.data(),
+                                      (uint32_t)mask.indices.size());
+        } else {
+            spdlog::warn("[VR] Hidden-area mask eye {} projection was invalid; rendering the full eye", eye);
+            xr.gfx->SetVisibilityMask(eye, nullptr, 0, nullptr, 0);
+        }
+        mask.dirty = false;
+        mask.uploaded_fov = fov;
+        mask.has_uploaded_fov = true;
+    }
+}
+
 static void poll_events() {
     XrEventDataBuffer event = { XR_TYPE_EVENT_DATA_BUFFER };
     while (xrPollEvent(xr.instance, &event) == XR_SUCCESS) {
@@ -804,6 +980,14 @@ static void poll_events() {
             } else {
                 spdlog::info("[VR] Runtime reports the headset not worn before ever reporting it worn; "
                              "staying in VR (proximity sensor may be disabled or not forwarded)");
+            }
+        } else if (event.type == XR_TYPE_EVENT_DATA_VISIBILITY_MASK_CHANGED_KHR) {
+            auto* maskEvent = reinterpret_cast<XrEventDataVisibilityMaskChangedKHR*>(&event);
+            if (xr.visibility_mask_configured && maskEvent->session == xr.session &&
+                maskEvent->viewConfigurationType == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO &&
+                maskEvent->viewIndex < 2) {
+                spdlog::info("[VR] Runtime changed hidden-area mask for eye {}", maskEvent->viewIndex);
+                vr_query_visibility_mask(maskEvent->viewIndex);
             }
         } else if (event.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
             spdlog::warn("[VR] OpenXR instance loss pending (runtime shutting down or restarting)");
@@ -1105,6 +1289,7 @@ static struct {
     uint16_t latch_buttons[2];
     bool latch_trigger[2], latch_squeeze[2], latch_stick[2];
 } g_menu = { false, {}, {}, false, false, 0.0, 0.0, -1 };
+static bool g_notifications_visible = false;
 
 static std::shared_ptr<Ship::GuiWindow> vr_menu_window() {
     Ship::Context* ctx = Ship::Context::GetRawInstance();
@@ -1313,7 +1498,20 @@ static void vr_menu_fill_beam() {
 }
 
 bool vr_menu_panel_active() {
+    return xr.initialized && xr.enabled && xr.session_running && (g_menu.open || g_notifications_visible);
+}
+
+bool vr_menu_interactive() {
     return xr.initialized && xr.enabled && xr.session_running && g_menu.open;
+}
+
+void vr_set_notifications_visible(bool visible) {
+    if (visible && !g_notifications_visible) {
+        // Do not expose the previous interactive-menu image for one frame while the notification
+        // ImGui draw data is still being rendered into this shared transparent swapchain.
+        xr.menu_ever_rendered = false;
+    }
+    g_notifications_visible = visible;
 }
 
 void vr_menu_panel_size(int* w, int* h) {
@@ -1822,6 +2020,9 @@ static bool vr_create_instance(const char* required_ext, const char* api_name, c
     xr.color_scale_supported = false;
     xr.perf_settings_supported = false;
     xr.refresh_rate_supported = false;
+    xr.visibility_mask_supported = false;
+    xr.visibility_mask_extension_enabled = false;
+    xr.get_visibility_mask = nullptr;
     {
         bool required_offered = false;
         uint32_t ext_count = 0;
@@ -1840,6 +2041,9 @@ static bool vr_create_instance(const char* required_ext, const char* api_name, c
             }
             if (strcmp(p.extensionName, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME) == 0) {
                 xr.refresh_rate_supported = true;
+            }
+            if (strcmp(p.extensionName, XR_KHR_VISIBILITY_MASK_EXTENSION_NAME) == 0) {
+                xr.visibility_mask_supported = true;
             }
             if (strcmp(p.extensionName, required_ext) == 0) {
                 required_offered = true;
@@ -1866,6 +2070,10 @@ static bool vr_create_instance(const char* required_ext, const char* api_name, c
     if (xr.refresh_rate_supported) {
         extensions.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
     }
+    if (xr.visibility_mask_supported && CVarGetInteger("gVrHiddenAreaMask", 0) != 0) {
+        extensions.push_back(XR_KHR_VISIBILITY_MASK_EXTENSION_NAME);
+        xr.visibility_mask_extension_enabled = true;
+    }
 #ifdef __ANDROID__
     extensions.push_back(XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME);
 #endif
@@ -1891,6 +2099,18 @@ static bool vr_create_instance(const char* required_ext, const char* api_name, c
         return false;
     }
     vr_log_instance_properties();
+
+    if (xr.visibility_mask_extension_enabled) {
+        const XrResult procResult =
+            xrGetInstanceProcAddr(xr.instance, "xrGetVisibilityMaskKHR",
+                                  reinterpret_cast<PFN_xrVoidFunction*>(&xr.get_visibility_mask));
+        if (XR_FAILED(procResult) || xr.get_visibility_mask == nullptr) {
+            spdlog::warn("[VR] XR_KHR_visibility_mask was enabled but xrGetVisibilityMaskKHR is unavailable; "
+                         "rendering complete eye images");
+            xr.visibility_mask_extension_enabled = false;
+            xr.get_visibility_mask = nullptr;
+        }
+    }
     return true;
 }
 
@@ -2077,6 +2297,32 @@ static bool vr_session_init() {
                  xr.config_views[0].recommendedImageRectWidth,
                  xr.config_views[0].recommendedImageRectHeight);
 
+    // Query the runtime mesh before eye targets are attached: the backend can then select a
+    // stencil-capable depth format only when a real mask is available. Failure is deliberately a
+    // full-eye fallback, never a session failure.
+    xr.visibility_mask_configured = false;
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        vr_clear_visibility_mask(eye);
+    }
+    xr.gfx->ConfigureVisibilityMask(false);
+    const bool visibilityMaskRequested = CVarGetInteger("gVrHiddenAreaMask", 0) != 0;
+    if (visibilityMaskRequested && xr.visibility_mask_extension_enabled) {
+        bool anyMask = false;
+        for (uint32_t eye = 0; eye < 2; ++eye) {
+            anyMask |= vr_query_visibility_mask(eye);
+        }
+        if (anyMask && xr.gfx->ConfigureVisibilityMask(true)) {
+            xr.visibility_mask_configured = true;
+            spdlog::info("[VR] Hidden-area mask enabled; lens-hidden pixels will be rejected with stencil");
+        } else if (anyMask) {
+            spdlog::info("[VR] Hidden-area mask unavailable on the active graphics backend; rendering full eyes");
+        } else {
+            spdlog::info("[VR] Hidden-area mask unavailable: the runtime supplied no valid hidden mesh");
+        }
+    } else if (visibilityMaskRequested) {
+        spdlog::info("[VR] Hidden-area mask unavailable: the OpenXR runtime does not support it");
+    }
+
     // --- Enumerate Swapchain Formats ---
     uint32_t format_count = 0;
     xrEnumerateSwapchainFormats(xr.session, 0, &format_count, nullptr);
@@ -2214,6 +2460,10 @@ void vr_shutdown() {
     xr.eyes_ever_rendered = false;
     xr.multiview = false;
     xr.multiview_pass = false;
+    xr.visibility_mask_configured = false;
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        vr_clear_visibility_mask(eye);
+    }
     xr.flat_screen = false;
     xr.flat_screen_prev = false;
 
@@ -2240,8 +2490,21 @@ void vr_shutdown() {
         xrDestroyInstance(xr.instance);
         xr.instance = XR_NULL_HANDLE;
     }
+    xr.visibility_mask_extension_enabled = false;
+    xr.visibility_mask_supported = false;
+    xr.get_visibility_mask = nullptr;
 
     spdlog::info("[VR] OpenXR shut down");
+}
+
+void vr_shutdown_final() {
+    // Context is a static object, so its window is destroyed while the C++ runtime, renderer and
+    // OpenXR loader are themselves being torn down. Calling either backend virtual functions or
+    // xrDestroy* here uses objects whose lifetime has already ended. The operating system reclaims
+    // every remaining process-owned D3D/OpenXR resource immediately after this destructor.
+    xr.initialized = false;
+    xr.session_running = false;
+    (void)xr.gfx.release();
 }
 
 // --------------------------------------------------------------------------
@@ -2265,6 +2528,7 @@ bool vr_should_present_desktop() { return xr.plan_present_desktop; }
 namespace {
 
 VrFrameStats g_stats = {};
+float g_last_wait_ms = 0.0f;
 // Rate counters: count events, convert to Hz once a second so the readout is stable.
 int g_eye_pass_count = 0;
 int g_frame_count = 0;
@@ -2470,7 +2734,9 @@ bool vr_begin_frame() {
     XrFrameWaitInfo wait_info = { XR_TYPE_FRAME_WAIT_INFO };
     const auto wait_start = std::chrono::steady_clock::now();
     const XrResult wait_result = xrWaitFrame(xr.session, &wait_info, &xr.frame_state);
-    smooth(g_stats.wait_ms, std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - wait_start).count());
+    g_last_wait_ms =
+        std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - wait_start).count();
+    smooth(g_stats.wait_ms, g_last_wait_ms);
     if (!xr_check(wait_result, "xrWaitFrame")) {
         return false;
     }
@@ -2816,6 +3082,7 @@ bool vr_begin_frame() {
         build_projection_matrix(xr.views[eye].fov, xr.near_clip, xr.far_clip, xr.projection[eye]);
         pose_to_view_matrix(xr.views[eye].pose, xr.world_scale, xr.view[eye]);
     }
+    vr_update_visibility_masks();
     vr_build_center_view();
 
     return true;
@@ -2955,6 +3222,167 @@ static float vr_panel_distance(const XrPosef& pose, float w, float h, const glm:
     const float dx = std::max(fabsf(l.x) - w * 0.5f, 0.0f);
     const float dy = std::max(fabsf(l.y) - h * 0.5f, 0.0f);
     return sqrtf(dx * dx + dy * dy + l.z * l.z);
+}
+
+// Exact raw-tracking-space pose and dimensions used to submit a physical-key compositor card.
+// Interaction consumes this same description, so layout, per-key scale and the anchored centre
+// shift cannot diverge from the visible card.
+static bool vr_hud_key_card_raw(int element, XrPosef* out_pose, float* out_width_m, float* out_height_m) {
+    if (out_pose == nullptr || out_width_m == nullptr || out_height_m == nullptr ||
+        (element != VR_HUD_EL_PHYSICAL_KEYS && element != VR_HUD_EL_PHYSICAL_BOSS_KEY) ||
+        !xr.initialized || !vr_hud_wrist_layout()) return false;
+    const int owner = vr_hud_el_hand(element);
+    XrPosef panel;
+    float mpu, wu, hu;
+    if (owner < 0 || !vr_wrist_panel_pose(owner, &panel, &mpu, &wu, &hu)) return false;
+    const int key = element == VR_HUD_EL_PHYSICAL_KEYS ? 0 : 1;
+    const int card = key + 1;
+    if (!xr.hud_placed[element] || !xr.hud_rect_valid[element] || !xr.hud_back_valid[owner][card]) return false;
+    const float* base = xr.hud_block[owner];
+    const float* bounds = xr.hud_back[owner][card];
+    const float base_cx = ((base[0] + base[2]) * 0.5f - owner * kWristCanvasW) / kWristPack;
+    const float base_cy = (base[1] + base[3]) * 0.5f / kWristPack;
+    const float card_cx = ((bounds[0] + bounds[2]) * 0.5f - owner * kWristCanvasW) / kWristPack;
+    const float card_cy = (bounds[1] + bounds[3]) * 0.5f / kWristPack;
+    const float card_width = (bounds[2] - bounds[0]) / kWristPack;
+    const float card_height = (bounds[3] - bounds[1]) / kWristPack;
+    const float display_scale = xr.hud_key_display_scale[key];
+    const float side = key == 0 ? -1.0f : 1.0f;
+    const float shift_x = card_cx - base_cx + side * card_width * 0.5f * (display_scale - 1.0f);
+    const float shift_y = -(card_cy - base_cy);
+    const glm::quat q(panel.orientation.w, panel.orientation.x, panel.orientation.y, panel.orientation.z);
+    const glm::vec3 center = glm::vec3(panel.position.x, panel.position.y, panel.position.z) +
+                             q * glm::vec3(shift_x * mpu, shift_y * mpu, 0.0f);
+    *out_pose = panel;
+    out_pose->position = { center.x, center.y, center.z };
+    *out_width_m = card_width * display_scale * mpu;
+    *out_height_m = card_height * display_scale * mpu;
+    return true;
+}
+
+// Raw tracking-space pose that drives the visible hand. A held-object simulation can displace the
+// rendered hand from the controller, so HUD contact must follow that same displacement.
+static XrPosef vr_effective_grip_pose_raw(int hand) {
+    float sp[3];
+    float sq[4];
+    if (vrphys_get_hand_sim_pose_raw(hand, sp, sq)) {
+        XrPosef p;
+        p.position = { sp[0], sp[1], sp[2] };
+        p.orientation = { sq[0], sq[1], sq[2], sq[3] };
+        return p;
+    }
+    return xr.grip_pose_raw[hand];
+}
+
+// The shared model-to-grip calibration used by both live hand rendering and wrist-HUD contact.
+static void vr_hand_calibration(int hand, glm::vec3* cal_deg, glm::vec3* off_cm, int* mirror_axis,
+                                bool* mirrored) {
+    int axis = CVarGetInteger("gVrHandMirrorAxis", 2);
+    if (axis < 0 || axis > 2) axis = 2;
+    glm::vec3 cal(CVarGetFloat("gVrHandCalPitch", 88.0f), CVarGetFloat("gVrHandCalYaw", -100.0f),
+                  CVarGetFloat("gVrHandCalRoll", 80.0f));
+    glm::vec3 off(CVarGetFloat("gVrHandOffX", 0.0f), CVarGetFloat("gVrHandOffY", 6.3f),
+                  CVarGetFloat("gVrHandOffZ", 0.0f));
+    const bool mirror = g_hand_mirror[hand];
+    if (hand == 0 && CVarGetInteger("gVrHandLOverride", 1)) {
+        cal = glm::vec3(CVarGetFloat("gVrHandLCalPitch", -149.0f), CVarGetFloat("gVrHandLCalYaw", 76.0f),
+                        CVarGetFloat("gVrHandLCalRoll", 30.0f));
+        off = glm::vec3(CVarGetFloat("gVrHandLOffX", 0.0f), CVarGetFloat("gVrHandLOffY", 6.3f),
+                        CVarGetFloat("gVrHandLOffZ", 0.0f));
+    } else if (hand == 1 || !mirror) {
+        for (int k = 0; k < 3; k++) {
+            if (k != axis) cal[k] = -cal[k];
+        }
+        off[axis] = -off[axis];
+    }
+    *cal_deg = cal;
+    *off_cm = off;
+    *mirror_axis = axis;
+    *mirrored = mirror;
+}
+
+// Contact centre of the ACTUALLY RENDERED hand, converted back to raw tracking space for comparison
+// with compositor cards. The hand renderer composes its pose in game-world space; rebuilding a point
+// directly from grip_pose_raw misses the interpolated anchor-yaw frame and can be displaced by tens
+// of centimetres from the mesh visible in the eye image.
+static glm::vec3 vr_visible_hand_contact_raw(int hand) {
+    const XrPosef p = apply_turn(vr_effective_grip_pose_raw(hand));
+    const glm::quat q(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z);
+    glm::vec3 cal_deg, off_cm;
+    int mirror_axis;
+    bool mirrored;
+    vr_hand_calibration(hand, &cal_deg, &off_cm, &mirror_axis, &mirrored);
+    const float kDeg = 3.14159265358979323846f / 180.0f;
+    const glm::quat model_q = q * glm::quat(cal_deg * kDeg);
+    float model_x_sign = 1.0f;
+    if (mirrored && mirror_axis == 0) model_x_sign = -1.0f;
+
+    glm::vec3 anchor(0.0f);
+    float gamma = 0.0f;
+    if (xr.first_person && xr.anchor_initialized) {
+        anchor = vr_anchor_now();
+        gamma = xr.anchor_gamma_prev + (xr.anchor_gamma - xr.anchor_gamma_prev) * xr.interp_alpha;
+    }
+    const float ws = std::max(xr.world_scale, 1.0f);
+    // Open-hand assets run from the wrist along model +X (862 adult / 548 child units). The palm
+    // centre is about 30% along that span. Apply this in the same calibrated model frame and scale
+    // used by vr_get_hand_matrix, so the contact volume occupies the visible palm rather than the
+    // controller/wrist origin behind it.
+    const float model_length = vr_hud_profile() ? 548.0f : 862.0f;
+    const glm::vec3 palm_from_root_world =
+        model_q * glm::vec3(model_x_sign * model_length * g_hand_scale * 0.30f, 0.0f, 0.0f);
+    const glm::vec3 rendered_world =
+        anchor + (glm::vec3(p.position.x, p.position.y, p.position.z) + q * (off_cm * 0.01f)) * ws +
+        palm_from_root_world;
+
+    // Exact positional inverse of the camera/compositor mapping used by game_world_to_raw:
+    // world = anchor + unyaw(gamma) * (turn * raw) * world_scale.
+    const float cg = cosf(gamma), sg = sinf(gamma);
+    const glm::mat3 unyaw(glm::vec3(cg, 0.0f, sg), glm::vec3(0.0f, 1.0f, 0.0f),
+                          glm::vec3(-sg, 0.0f, cg));
+    const glm::vec3 turned = glm::transpose(unyaw) * ((rendered_world - anchor) / ws);
+    return glm::inverse(g_turn_rot) * (turned - g_turn_off);
+}
+
+bool vr_get_hud_element_hand_distance(int hand, int element, float* distance_m) {
+    if (distance_m == nullptr || hand < 0 || hand > 1 || element <= VR_HUD_EL_OTHER ||
+        element >= VR_HUD_EL_COUNT || !xr.initialized || !xr.hand_active[hand] ||
+        !vr_hud_wrist_layout() || !xr.hud_placed[element] || !xr.hud_rect_valid[element]) {
+        return false;
+    }
+    const int owner = vr_hud_el_hand(element);
+    XrPosef panel;
+    float mpu, wu, hu;
+    if (owner < 0 || !vr_wrist_panel_pose(owner, &panel, &mpu, &wu, &hu)) {
+        return false;
+    }
+    const glm::quat pq(panel.orientation.w, panel.orientation.x, panel.orientation.y, panel.orientation.z);
+    const glm::vec3 pc(panel.position.x, panel.position.y, panel.position.z);
+    if (element == VR_HUD_EL_PHYSICAL_KEYS || element == VR_HUD_EL_PHYSICAL_BOSS_KEY) {
+        // The finite visible compositor card is the target. Measure it against the controller-held
+        // centre of the rendered hand; gVrKeyGrabRadius supplies the hand's physical thickness.
+        XrPosef card_pose;
+        float card_width_m, card_height_m;
+        if (!vr_hud_key_card_raw(element, &card_pose, &card_width_m, &card_height_m)) return false;
+        *distance_m = vr_panel_distance(card_pose, card_width_m, card_height_m,
+                                        vr_visible_hand_contact_raw(hand));
+        return true;
+    }
+    const float x0 = (xr.hud_slot[element][0] - owner * kWristCanvasW) / kWristPack;
+    const float y0 = xr.hud_slot[element][1] / kWristPack;
+    const float scale = xr.hud_slot[element][2] / kWristPack;
+    float x1 = x0 + (xr.hud_rect[element][2] - xr.hud_rect[element][0]) * scale;
+    float y1 = y0 + (xr.hud_rect[element][3] - xr.hud_rect[element][1]) * scale;
+    float center_x = (x0 + x1) * 0.5f - wu * 0.5f;
+    float width = x1 - x0, height = y1 - y0;
+    const glm::vec3 center = pc + pq * glm::vec3(center_x * mpu,
+                                                  (hu * 0.5f - (y0 + y1) * 0.5f) * mpu, 0.0f);
+    XrPosef element_pose = panel;
+    element_pose.position = { center.x, center.y, center.z };
+    const XrPosef& grip = xr.grip_pose_raw[hand];
+    *distance_m = vr_panel_distance(element_pose, width * mpu, height * mpu,
+                                    glm::vec3(grip.position.x, grip.position.y, grip.position.z));
+    return true;
 }
 
 // In-headset HUD editing. Runs every XR frame after input is read and the raw grips are known,
@@ -3234,7 +3662,7 @@ void vr_end_frame() {
                                  std::max(xr.hud_world_size[1] * canvas[1] / ws, 0.01f) };
     }
 
-    XrCompositionLayerQuad wrist_layers[2];
+    XrCompositionLayerQuad wrist_layers[6];
     uint32_t wrist_count = 0;
     const bool wrist_layout = vr_hud_wrist_layout();
     if (wrist_layout && !xr.hud_world && xr.hud_ever_rendered && xr.hud_commands != nullptr) {
@@ -3251,18 +3679,44 @@ void vr_end_frame() {
                 continue;
             }
 
-            XrCompositionLayerQuad& L = wrist_layers[wrist_count++];
-            L = { XR_TYPE_COMPOSITION_LAYER_QUAD };
-            L.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-            L.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-            L.space = xr.local_space;
-            L.subImage.swapchain = sc.handle;
-            L.subImage.imageRect.offset = { (int32_t)(b[0] * sx), (int32_t)(b[1] * sy) };
-            L.subImage.imageRect.extent = { std::max((int32_t)((b[2] - b[0]) * sx + 0.5f), 1),
-                                            std::max((int32_t)((b[3] - b[1]) * sy + 0.5f), 1) };
-            L.subImage.imageArrayIndex = 0;
-            L.pose = pose;
-            L.size = { std::max(w_units * mpu, 0.005f), std::max(h_units * mpu, 0.005f) };
+            const glm::quat panel_q(pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z);
+            const float base_cx = ((b[0] + b[2]) * 0.5f - hand * kWristCanvasW) / kWristPack;
+            const float base_cy = (b[1] + b[3]) * 0.5f / kWristPack;
+            // Physical keys are rendered into the stereo projection pass for real depth occlusion.
+            for (int card = 0; card < 1; ++card) {
+                if (!xr.hud_back_valid[hand][card]) continue;
+                const float* cb = xr.hud_back[hand][card];
+                float card_w_units = (cb[2] - cb[0]) / kWristPack;
+                float card_h_units = (cb[3] - cb[1]) / kWristPack;
+                const float card_cx = ((cb[0] + cb[2]) * 0.5f - hand * kWristCanvasW) / kWristPack;
+                const float card_cy = (cb[1] + cb[3]) * 0.5f / kWristPack;
+                float shift_x = card_cx - base_cx;
+                if (card > 0) {
+                    const float display_scale = xr.hud_key_display_scale[card - 1];
+                    const float side = card == 1 ? -1.0f : 1.0f;
+                    shift_x += side * card_w_units * 0.5f * (display_scale - 1.0f);
+                    card_w_units *= display_scale;
+                    card_h_units *= display_scale;
+                }
+                const glm::vec3 shift = panel_q * glm::vec3(shift_x * mpu,
+                                                             -(card_cy - base_cy) * mpu, 0.0f);
+
+                XrCompositionLayerQuad& L = wrist_layers[wrist_count++];
+                L = { XR_TYPE_COMPOSITION_LAYER_QUAD };
+                L.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                L.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                L.space = xr.local_space;
+                L.subImage.swapchain = sc.handle;
+                L.subImage.imageRect.offset = { (int32_t)(cb[0] * sx), (int32_t)(cb[1] * sy) };
+                L.subImage.imageRect.extent = { std::max((int32_t)((cb[2] - cb[0]) * sx + 0.5f), 1),
+                                                std::max((int32_t)((cb[3] - cb[1]) * sy + 0.5f), 1) };
+                L.subImage.imageArrayIndex = 0;
+                L.pose = pose;
+                L.pose.position.x += shift.x;
+                L.pose.position.y += shift.y;
+                L.pose.position.z += shift.z;
+                L.size = { std::max(card_w_units * mpu, 0.005f), std::max(card_h_units * mpu, 0.005f) };
+            }
         }
     }
 
@@ -3329,20 +3783,26 @@ void vr_end_frame() {
     // the head so it reads as a line from any angle.
     XrCompositionLayerQuad menu_layer = { XR_TYPE_COMPOSITION_LAYER_QUAD };
     XrCompositionLayerQuad beam_layer = { XR_TYPE_COMPOSITION_LAYER_QUAD };
-    const bool menu_visible = g_menu.open && xr.menu_ever_rendered;
+    const bool notification_visible = g_notifications_visible && !g_menu.open;
+    const bool menu_visible = (g_menu.open || notification_visible) && xr.menu_ever_rendered;
     bool beam_visible = false;
     if (menu_visible) {
         menu_layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
         menu_layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-        menu_layer.space = xr.local_space;
+        menu_layer.space = notification_visible ? xr.view_space : xr.local_space;
         menu_layer.subImage.swapchain = xr.menu_swapchain.handle;
         menu_layer.subImage.imageRect.offset = { 0, 0 };
         menu_layer.subImage.imageRect.extent = { (int32_t)xr.menu_swapchain.width, (int32_t)xr.menu_swapchain.height };
-        menu_layer.pose = g_menu.pose;
-        menu_layer.size = { g_menu.size[0], g_menu.size[1] };
+        if (notification_visible) {
+            menu_layer.pose = { { 0, 0, 0, 1 }, { 0.0f, 0.0f, -1.35f } };
+            menu_layer.size = { 1.4f, 1.4f * (float)kMenuPanelH / (float)kMenuPanelW };
+        } else {
+            menu_layer.pose = g_menu.pose;
+            menu_layer.size = { g_menu.size[0], g_menu.size[1] };
+        }
 
         const int bh = g_menu.hand;
-        if (xr.beam_ready && bh >= 0 && xr.hand_active[bh] && xr.head_raw_valid) {
+        if (g_menu.open && xr.beam_ready && bh >= 0 && xr.hand_active[bh] && xr.head_raw_valid) {
             const XrPosef& a = xr.aim_pose_raw[bh];
             const glm::vec3 o(a.position.x, a.position.y, a.position.z);
             const glm::vec3 d = glm::normalize(
@@ -3546,6 +4006,11 @@ void vr_begin_eye(int eye) {
     wait_info.timeout = XR_INFINITE_DURATION;
     xr_check(xrWaitSwapchainImage(sc.handle, &wait_info), "xrWaitSwapchainImage");
 
+    // The desktop companion copies the left eye. Render that eye completely on companion-update
+    // frames so the monitor never exposes the lens-hidden cutout; headset-only frames retain the
+    // visibility-mask saving. The right eye remains masked in two-pass mode.
+    xr.gfx->SetVisibilityMaskEyesForPass((eye == 0 && xr.plan_present_desktop) ? 0u : (1u << eye));
+
     // Bind, clear (opaque black, depth 1.0), full viewport, renderer told the target size.
     const float clear_color[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
     xr.gfx->BeginPass(vr_eye_target(eye), image_index, clear_color);
@@ -3577,6 +4042,10 @@ bool vr_multiview_enabled() {
     return xr.initialized && xr.multiview;
 }
 
+bool vr_visibility_mask_enabled() {
+    return xr.initialized && xr.gfx && xr.gfx->VisibilityMaskActive();
+}
+
 void vr_begin_stereo() {
     if (!xr.initialized || !xr.multiview) return;
     xr.current_eye = kCenterEye;
@@ -3594,6 +4063,10 @@ void vr_begin_stereo() {
     XrSwapchainImageWaitInfo wait_info = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
     wait_info.timeout = XR_INFINITE_DURATION;
     xr_check(xrWaitSwapchainImage(sc.handle, &wait_info), "xrWaitSwapchainImage");
+
+    // Both layers share one draw pass but have independent stencil slices. Leave the mirrored left
+    // layer complete while retaining the right-eye mask; headset-only frames mask both eyes.
+    xr.gfx->SetVisibilityMaskEyesForPass(xr.plan_present_desktop ? 0x2u : 0x3u);
 
     const float clear_color[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
     xr.gfx->BeginPass(vrgfx::Target::EyeArray, image_index, clear_color);
@@ -3856,6 +4329,10 @@ bool vr_is_initialized() {
     return xr.initialized && xr.enabled;
 }
 
+bool vr_is_session_focused() {
+    return xr.initialized && xr.enabled && xr.session_running && xr.session_state == XR_SESSION_STATE_FOCUSED;
+}
+
 // vr_init retry window (vr_apply_mode_request): a headset that isn't available yet, or a session
 // being re-established after a loss, gets kVrRetryWindow of attempts before VR is turned off.
 static struct {
@@ -4012,6 +4489,24 @@ uint32_t vr_get_refresh_rate() {
     return xr.refresh_rate ? xr.refresh_rate : 90;
 }
 
+float vr_get_last_wait_ms() {
+    return g_last_wait_ms;
+}
+
+void vr_gpu_timing_frame_begin() { if (xr.gfx) xr.gfx->TimingFrameBegin(); }
+void vr_gpu_timing_phase_begin(int phase) {
+    if (xr.gfx && phase >= 0 && phase < static_cast<int>(vrgfx::TimingPhase::Count))
+        xr.gfx->TimingPhaseBegin(static_cast<vrgfx::TimingPhase>(phase));
+}
+void vr_gpu_timing_phase_end(int phase) {
+    if (xr.gfx && phase >= 0 && phase < static_cast<int>(vrgfx::TimingPhase::Count))
+        xr.gfx->TimingPhaseEnd(static_cast<vrgfx::TimingPhase>(phase));
+}
+void vr_gpu_timing_frame_end() { if (xr.gfx) xr.gfx->TimingFrameEnd(); }
+bool vr_gpu_timing_get_latest(float* eyes, float* hud, float* desktop, float* total) {
+    return xr.gfx && xr.gfx->TimingGetLatest(eyes, hud, desktop, total);
+}
+
 float vr_get_world_scale() {
     return xr.world_scale;
 }
@@ -4098,15 +4593,7 @@ void vr_set_interp_alpha(float alpha) {
 // press against surfaces and lag with inertia. Sim state is raw tracking space, so the artificial
 // turn is applied here exactly like everything else game-facing.
 static XrPosef vr_effective_grip_pose(int hand) {
-    float sp[3];
-    float sq[4];
-    if (vrphys_get_hand_sim_pose_raw(hand, sp, sq)) {
-        XrPosef p;
-        p.position = { sp[0], sp[1], sp[2] };
-        p.orientation = { sq[0], sq[1], sq[2], sq[3] };
-        return apply_turn(p);
-    }
-    return xr.grip_pose[hand];
+    return apply_turn(vr_effective_grip_pose_raw(hand));
 }
 
 bool vr_get_hand_pose(int hand, float out_pos[3], float out_quat[4]) {
@@ -4277,10 +4764,6 @@ void vr_trigger_haptic(int hand, float amplitude01, float freq_hz, float duratio
 // hands judder (the camera is smooth for the same reason — it's replaced live per eye). g_hand_scale
 // is Link's model scale, folded into the hand matrix so the live-replaced hand renders at full size.
 static std::unordered_map<const void*, int> g_hand_mtx_registry;
-static float g_hand_scale = 1.0f;
-static bool g_hand_mirror[2] = { false, false }; // per controller hand: reflect the hand geometry
-                                                 // (flip handedness) when it drives Link's
-                                                 // opposite-side hand model
 
 // Hand draw matrix (model-local -> game-world) in the engine's row-vector MtxF layout, for pinning
 // Link's hand limb to the controller. Same world position as vr_get_hand_pose (anchor + grip_pos *
@@ -4308,33 +4791,19 @@ bool vr_get_hand_matrix(int hand, float out[4][4]) {
     // along model +X (the sword blade extends along hand-space +X, see the melee weapon tip/base in
     // z_player_lib.c), so the left<->right symmetry plane must KEEP X and flip the thumb axis —
     // default Z. Reflecting X itself (old default) turns the mesh inside-out instead of opposite-handed.
-    int axis = CVarGetInteger("gVrHandMirrorAxis", 2);
-    if (axis < 0 || axis > 2) axis = 2;
-    const bool mirrored = g_hand_mirror[hand];
+    int axis;
+    bool mirrored;
     // Calibration (model rest pose -> controller grip frame). Defaults were hand-tuned in-headset
     // against the MIRRORED sword hand on the right controller, which uses the mirror-conjugate of
     // these values (F * cal * F: the Euler component about the mirror axis is preserved, the other
     // two are negated). An UNMIRRORED hand also uses the conjugate regardless of controller: OpenXR
     // grip frames are defined per-hand (palm-relative), so mirror-symmetric physical poses report
     // the same orientation — an unreflected mesh attaches with the same rotation on either side.
-    glm::vec3 calDeg(CVarGetFloat("gVrHandCalPitch", 88.0f), CVarGetFloat("gVrHandCalYaw", -100.0f),
-                     CVarGetFloat("gVrHandCalRoll", 80.0f));
+    glm::vec3 calDeg;
     // Positional offset (real cm) in the controller grip frame, so the hand mesh can be nudged
     // to sit naturally on the controller; the conjugate reflects it (negate the mirror-axis component).
-    glm::vec3 off(CVarGetFloat("gVrHandOffX", 0.0f), CVarGetFloat("gVrHandOffY", 6.3f),
-                  CVarGetFloat("gVrHandOffZ", 0.0f));
-    if (hand == 0 && CVarGetInteger("gVrHandLOverride", 1)) {
-        // Fully independent left-controller tuning (values used literally, no conjugation).
-        calDeg = glm::vec3(CVarGetFloat("gVrHandLCalPitch", -149.0f), CVarGetFloat("gVrHandLCalYaw", 76.0f),
-                           CVarGetFloat("gVrHandLCalRoll", 30.0f));
-        off = glm::vec3(CVarGetFloat("gVrHandLOffX", 0.0f), CVarGetFloat("gVrHandLOffY", 6.3f),
-                        CVarGetFloat("gVrHandLOffZ", 0.0f));
-    } else if (hand == 1 || !mirrored) {
-        for (int k = 0; k < 3; k++) {
-            if (k != axis) calDeg[k] = -calDeg[k];
-        }
-        off[axis] = -off[axis];
-    }
+    glm::vec3 off;
+    vr_hand_calibration(hand, &calDeg, &off, &axis, &mirrored);
     // The offsets are real centimetres (how the hand sits on the controller is about the player's
     // grip, not the game world), so they hold at any world scale.
     off *= 0.01f * xr.world_scale;
@@ -4649,6 +5118,8 @@ static int vr_hud_el_hand(int el) {
         case VR_HUD_EL_KEYS:
         case VR_HUD_EL_TIMER:
         case VR_HUD_EL_GAME_TIMER:
+        case VR_HUD_EL_PHYSICAL_KEYS:
+        case VR_HUD_EL_PHYSICAL_BOSS_KEY:
             return 0;
         case VR_HUD_EL_BTN_B:
         case VR_HUD_EL_BTN_A:
@@ -4677,13 +5148,14 @@ static int vr_hud_el_hand(int el) {
 // doubled in resolution to match, so elements are exactly as sharp as before).
 static const int kWristRows[2][16] = {
     { VR_HUD_EL_HEARTS, -1, VR_HUD_EL_MAGIC, -1, VR_HUD_EL_RUPEES, VR_HUD_EL_KEYS, -1, VR_HUD_EL_TIMER,
-      VR_HUD_EL_GAME_TIMER, -2 },
+      VR_HUD_EL_GAME_TIMER, -1, VR_HUD_EL_PHYSICAL_KEYS, VR_HUD_EL_PHYSICAL_BOSS_KEY, -2 },
     { -3, VR_HUD_EL_BTN_DPAD, VR_HUD_EL_MOUNT, -1, VR_HUD_EL_MINIMAP, -2 }, // -3 = the button cluster
 };
 static constexpr float kWristCanvasH = 240.0f;
 static constexpr float kWristRegionW = kWristCanvasW / kWristPack; // layout units per hand
 static constexpr float kWristRegionH = kWristCanvasH / kWristPack;
 static constexpr float kWristGap = 3.0f;                    // between auto-laid-out elements, units
+static constexpr float kPhysicalKeyGap = 30.0f;             // visible seam between the two key cards
 
 // The settings profile in effect: Link's age, unless the menu forces one for preview.
 static int vr_hud_profile() {
@@ -4717,6 +5189,47 @@ void vr_hud_marker(uint32_t w1) {
         el = VR_HUD_EL_NONE;
     }
     xr.hud_el = el;
+    if (xr.key_world_pass) {
+        g_vr_rect_world = false;
+        if (el == VR_HUD_EL_PHYSICAL_KEYS || el == VR_HUD_EL_PHYSICAL_BOSS_KEY) {
+            XrPosef raw;
+            float width_m, height_m;
+            if (vr_hud_key_card_raw(el, &raw, &width_m, &height_m) && xr.hud_rect_valid[el]) {
+                const XrPosef turned = apply_turn(raw);
+                glm::vec3 anchor(0.0f);
+                float gamma = 0.0f;
+                if (xr.anchor_initialized) {
+                    anchor = vr_anchor_now();
+                    gamma = xr.anchor_gamma_prev + (xr.anchor_gamma - xr.anchor_gamma_prev) * xr.interp_alpha;
+                }
+                const float cg = cosf(gamma), sg = sinf(gamma);
+                const glm::mat3 unyaw(glm::vec3(cg, 0.0f, sg), glm::vec3(0.0f, 1.0f, 0.0f),
+                                      glm::vec3(-sg, 0.0f, cg));
+                const float ws = std::max(xr.world_scale, 1.0f);
+                const glm::vec3 center = anchor + unyaw *
+                    (glm::vec3(turned.position.x, turned.position.y, turned.position.z) * ws);
+                const glm::quat tq(turned.orientation.w, turned.orientation.x,
+                                   turned.orientation.y, turned.orientation.z);
+                const glm::quat world_q = glm::normalize(glm::quat_cast(unyaw) * tq);
+                const float* r = xr.hud_rect[el];
+                const float x0 = r[0] / 160.0f - 1.0f;
+                const float x1 = r[2] / 160.0f - 1.0f;
+                const float y0 = 1.0f - r[1] / 120.0f;
+                const float y1 = 1.0f - r[3] / 120.0f;
+                const float cx = (x0 + x1) * 0.5f, cy = (y0 + y1) * 0.5f;
+                const float sx = width_m * ws / std::max(x1 - x0, 1.0e-5f);
+                const float sy = height_m * ws / std::max(y0 - y1, 1.0e-5f);
+                const glm::mat4 panel = glm::translate(glm::mat4(1.0f), center) * glm::mat4_cast(world_q) *
+                    glm::scale(glm::mat4(1.0f), glm::vec3(sx, sy, 1.0f)) *
+                    glm::translate(glm::mat4(1.0f), glm::vec3(-cx, -cy, 0.0f));
+                for (int c = 0; c < 4; ++c)
+                    for (int row = 0; row < 4; ++row)
+                        g_vr_rect_world_mtx[c][row] = panel[c][row];
+                g_vr_rect_world = true;
+            }
+        }
+        return;
+    }
     const uint8_t alpha = (uint8_t)((w1 >> 16) & 0xFF);
     if (alpha > xr.hud_meas_alpha[el]) {
         xr.hud_meas_alpha[el] = alpha;
@@ -4740,6 +5253,10 @@ bool vr_hud_tri(const float ndc[6], float out[4]) {
     const int el = xr.hud_el;
     out[0] = out[3] = 1.0f;
     out[1] = out[2] = 0.0f;
+    if (xr.key_world_pass) {
+        return (xr.hud_el == VR_HUD_EL_PHYSICAL_KEYS ||
+                xr.hud_el == VR_HUD_EL_PHYSICAL_BOSS_KEY) && g_vr_rect_world;
+    }
     if (xr.hud_world_pass) {
         // The pause frame: every HUD element (vitals, buttons with Return / Save / Decide, the
         // equip fly-in), measured only to know which corner it belongs to; the wrists keep their
@@ -4893,6 +5410,13 @@ static void vr_hud_latch_and_layout() {
             char name[96];
             VrHudElementCVar(name, sizeof(name), child, d->key, "Scale");
             el_scale[el] = std::clamp(CVarGetFloat(name, d->scale[child]), 10.0f, 500.0f) / 100.0f;
+            if (el == VR_HUD_EL_PHYSICAL_KEYS || el == VR_HUD_EL_PHYSICAL_BOSS_KEY) {
+                const int key = el == VR_HUD_EL_PHYSICAL_KEYS ? 0 : 1;
+                xr.hud_key_display_scale[key] = el_scale[el];
+                // Keep a compact, non-overlapping copy in the shared HUD texture. Its compositor
+                // card applies the requested visual scale independently after cropping.
+                el_scale[el] = 1.0f;
+            }
             VrHudElementCVar(name, sizeof(name), child, d->key, "X");
             el_off[el][0] = CVarGetFloat(name, d->x[child]);
             VrHudElementCVar(name, sizeof(name), child, d->key, "Y");
@@ -4919,12 +5443,38 @@ static void vr_hud_latch_and_layout() {
             for (int k = 0; k < row_n; k++) {
                 row_h = std::max(row_h, el_h(row[k]));
             }
+            float row_w = 0.0f;
+            bool physical_key_row = false;
+            for (int k = 0; k < row_n; ++k) {
+                row_w += el_w(row[k]);
+                if (k + 1 < row_n) row_w += kWristGap;
+                physical_key_row |= row[k] == VR_HUD_EL_PHYSICAL_KEYS ||
+                                    row[k] == VR_HUD_EL_PHYSICAL_BOSS_KEY;
+            }
             float x = pad;
+            float physical_center = 0.0f;
+            if (physical_key_row) {
+                const float configured_w = vr_hud_panel_f(child, hand, "Width", pd.width);
+                const float parent_w = configured_w > 0.0f ? configured_w : max_x + pad;
+                physical_center = parent_w * 0.5f + CVarGetFloat("gVrPhysicalKeysOffsetX", 0.0f);
+            }
             for (int k = 0; k < row_n; k++) {
                 const int el = row[k];
                 const float w = el_w(el);
                 const float h = el_h(el);
-                float fx = x + el_off[el][0];
+                float base_x = x;
+                if (physical_key_row) {
+                    if (row_n == 1) {
+                        base_x = physical_center - w * 0.5f;
+                    } else if (el == VR_HUD_EL_PHYSICAL_KEYS) {
+                        base_x = physical_center - kPhysicalKeyGap * 0.5f - w;
+                    } else if (el == VR_HUD_EL_PHYSICAL_BOSS_KEY) {
+                        base_x = physical_center + kPhysicalKeyGap * 0.5f;
+                    }
+                }
+                // The two physical-key cards are one horizontal pair. A shared offset moves the
+                // pair without allowing stale per-icon X settings to pull its centre gap apart.
+                float fx = base_x + (physical_key_row ? 0.0f : el_off[el][0]);
                 float fy = y + (row_h - h) * 0.5f + el_off[el][1];
                 fx = std::clamp(fx, 0.0f, std::max(kWristRegionW - w, 0.0f));
                 fy = std::clamp(fy, 0.0f, std::max(kWristRegionH - h, 0.0f));
@@ -4934,7 +5484,7 @@ static void vr_hud_latch_and_layout() {
                 xr.hud_placed[el] = true;
                 max_x = std::max(max_x, fx + w);
                 max_y = std::max(max_y, fy + h);
-                x += w + kWristGap;
+                if (!physical_key_row) x += w + kWristGap;
             }
             y += row_h + kWristGap;
             row_n = 0;
@@ -5010,26 +5560,65 @@ static void vr_hud_latch_and_layout() {
         }
         flush_row();
 
-        // The card: fitted to the elements plus padding, or the size set in the settings.
+        // Size the original wrist card from original HUD elements only. Physical keys are separate
+        // child cards and must never move or resize this parent card.
+        float main_max_x = 0.0f, main_max_y = 0.0f, main_alpha = 0.0f;
+        bool main_any = false;
+        for (int el = 0; el < VR_HUD_EL_COUNT; ++el) {
+            if (!xr.hud_placed[el] || vr_hud_el_hand(el) != hand ||
+                el == VR_HUD_EL_PHYSICAL_KEYS || el == VR_HUD_EL_PHYSICAL_BOSS_KEY) continue;
+            const float x0 = (xr.hud_slot[el][0] - hand * kWristCanvasW) / kWristPack;
+            const float y0 = xr.hud_slot[el][1] / kWristPack;
+            main_max_x = std::max(main_max_x, x0 + el_w(el));
+            main_max_y = std::max(main_max_y, y0 + el_h(el));
+            main_alpha = std::max(main_alpha, xr.hud_alpha[el]);
+            main_any = true;
+        }
         float card_w = vr_hud_panel_f(child, hand, "Width", pd.width);
         float card_h = vr_hud_panel_f(child, hand, "Height", pd.height);
         if (card_w <= 0.0f) {
-            card_w = max_x + pad;
+            card_w = main_max_x + pad;
         }
         if (card_h <= 0.0f) {
-            card_h = max_y + pad;
+            card_h = main_max_y + pad;
         }
         card_w = std::clamp(card_w, 4.0f, kWristRegionW);
         card_h = std::clamp(card_h, 4.0f, kWristRegionH);
 
-        xr.hud_block_valid[hand] = any;
-        if (any) {
+        xr.hud_block_valid[hand] = main_any;
+        if (main_any) {
             xr.hud_block[hand][0] = hand * kWristCanvasW;
             xr.hud_block[hand][1] = 0.0f;
             xr.hud_block[hand][2] = hand * kWristCanvasW + card_w * kWristPack;
             xr.hud_block[hand][3] = card_h * kWristPack;
         }
-        xr.hud_block_alpha[hand] = block_alpha;
+        xr.hud_block_alpha[hand] = main_alpha;
+
+        // Three independently cropped cards share the parent's wrist transform: original HUD,
+        // Small Key, and Boss Key. Each key card is fitted only to its own icon.
+        for (int card = 0; card < 3; ++card) xr.hud_back_valid[hand][card] = false;
+        xr.hud_back_valid[hand][0] = main_any;
+        if (main_any) {
+            memcpy(xr.hud_back[hand][0], xr.hud_block[hand], sizeof(xr.hud_block[hand]));
+        }
+        if (hand == 0) {
+            // Leave a real transparent seam between the two cards (the row gap is 3 units).
+            const float box_pad = std::min(std::max(1.0f, pad * 0.33f), kWristGap * 0.4f);
+            const int key_elements[2] = { VR_HUD_EL_PHYSICAL_KEYS, VR_HUD_EL_PHYSICAL_BOSS_KEY };
+            for (int key = 0; key < 2; ++key) {
+                const int el = key_elements[key];
+                if (!xr.hud_placed[el]) continue;
+                const float x0 = (xr.hud_slot[el][0] - hand * kWristCanvasW) / kWristPack;
+                const float y0 = xr.hud_slot[el][1] / kWristPack;
+                xr.hud_back[hand][key + 1][0] = hand * kWristCanvasW + std::max(x0 - box_pad, 0.0f) * kWristPack;
+                xr.hud_back[hand][key + 1][1] = std::max(y0 - box_pad, 0.0f) * kWristPack;
+                xr.hud_back[hand][key + 1][2] = hand * kWristCanvasW +
+                    std::min(x0 + el_w(el) + box_pad, kWristRegionW) * kWristPack;
+                xr.hud_back[hand][key + 1][3] =
+                    std::min(y0 + el_h(el) + box_pad, kWristRegionH) * kWristPack;
+                xr.hud_back_valid[hand][key + 1] = true;
+            }
+        }
     }
 }
 
@@ -5075,14 +5664,24 @@ void vr_begin_hud() {
             if (!xr.hud_block_valid[hand] || backing <= 0.0f) {
                 continue;
             }
-            const float* b = xr.hud_block[hand];
-            const int32_t x0 = (int32_t)(b[0] * sx), y0 = (int32_t)(b[1] * sy);
-            const vrgfx::Rect rect = { x0, y0, (int32_t)(b[2] * sx + 0.5f) - x0, (int32_t)(b[3] * sy + 0.5f) - y0 };
             // In-headset editing: tint the card while a hand is in reach (blue) / holding it.
             const float a = std::max(backing * xr.hud_block_alpha[hand], xr.grab.hover[hand] ? 0.6f : 0.0f);
             const float tint = xr.grab.hover[hand] == 2 ? 0.35f : (xr.grab.hover[hand] == 1 ? 0.18f : 0.0f);
             const float dark[4] = { 0.0f, tint * 0.4f * a, tint * a, a };
-            xr.gfx->ClearColorRects(vrgfx::Target::Hud, image_index, &rect, 1, dark);
+            vrgfx::Rect rects[3];
+            int rect_count = 0;
+            // Physical key cards render inside the stereo eye pass so the hand can occlude them.
+            // Only the ordinary wrist card remains an OpenXR compositor quad.
+            for (int card = 0; card < 1; ++card) {
+                if (!xr.hud_back_valid[hand][card]) continue;
+                const float* b = xr.hud_back[hand][card];
+                const int32_t x0 = (int32_t)(b[0] * sx), y0 = (int32_t)(b[1] * sy);
+                rects[rect_count++] = { x0, y0, (int32_t)(b[2] * sx + 0.5f) - x0,
+                                       (int32_t)(b[3] * sy + 0.5f) - y0 };
+            }
+            if (rect_count > 0) {
+                xr.gfx->ClearColorRects(vrgfx::Target::Hud, image_index, rects, rect_count, dark);
+            }
         }
         for (int el = 0; el < VR_HUD_EL_COUNT; el++) {
             xr.hud_meas_any[el] = false;
@@ -5128,6 +5727,29 @@ void vr_end_hud() {
 bool vr_is_rendering_hud() { return xr.rendering_hud; }
 
 bool vr_is_rendering_screen() { return xr.rendering_screen; }
+
+bool vr_begin_key_world_pass() {
+    if (!xr.initialized || !xr.frame_began || xr.rendering_hud || xr.rendering_screen ||
+        !vr_hud_wrist_layout() || xr.hud_commands == nullptr) return false;
+    xr.key_world_pass = true;
+    xr.key_world_saved_rect = g_vr_rect_world;
+    memcpy(xr.key_world_saved_mtx, g_vr_rect_world_mtx, sizeof(g_vr_rect_world_mtx));
+    g_vr_rect_world = false;
+    g_vr_hud_layout_pass = true;
+    xr.hud_el = VR_HUD_EL_NONE;
+    return true;
+}
+
+void vr_end_key_world_pass() {
+    if (!xr.key_world_pass) return;
+    xr.key_world_pass = false;
+    g_vr_hud_layout_pass = false;
+    g_vr_rect_world = xr.key_world_saved_rect;
+    memcpy(g_vr_rect_world_mtx, xr.key_world_saved_mtx, sizeof(g_vr_rect_world_mtx));
+    vr_rebind_current_eye_target();
+}
+
+bool vr_is_key_world_pass() { return xr.key_world_pass; }
 
 // --------------------------------------------------------------------------
 // Text panel (message system on its own soft-follow quad)
@@ -5344,6 +5966,7 @@ Fast::Interpreter* vr_get_interpreter() { return nullptr; }
 bool vr_init() { return false; }
 void vr_apply_mode_request() {}
 void vr_shutdown() {}
+void vr_shutdown_final() {}
 bool vr_begin_frame() { return false; }
 void vr_end_frame() {}
 void vr_set_frame_plan(bool, bool, bool) {}
@@ -5361,6 +5984,7 @@ void vr_get_frame_stats(struct VrFrameStats* out) {
 void vr_begin_eye(int) {}
 void vr_end_eye(int) {}
 bool vr_multiview_enabled() { return false; }
+bool vr_visibility_mask_enabled() { return false; }
 void vr_begin_stereo() {}
 void vr_end_stereo() {}
 bool vr_is_multiview_pass() { return false; }
@@ -5378,9 +6002,16 @@ void vr_get_projection_matrix(int, float out[4][4]) { memset(out, 0, sizeof(floa
 void vr_get_fog_ndc_z_params(float* a, float* b) { *a = *b = 0.0f; }
 void vr_get_view_matrix(int, float out[4][4]) { memset(out, 0, sizeof(float) * 16); }
 bool vr_is_initialized() { return false; }
+bool vr_is_session_focused() { return false; }
 int vr_get_current_eye() { return 0; }
 void vr_get_recommended_resolution(uint32_t* w, uint32_t* h) { *w = 0; *h = 0; }
 uint32_t vr_get_refresh_rate() { return 90; }
+float vr_get_last_wait_ms() { return 0.0f; }
+void vr_gpu_timing_frame_begin() {}
+void vr_gpu_timing_phase_begin(int) {}
+void vr_gpu_timing_phase_end(int) {}
+void vr_gpu_timing_frame_end() {}
+bool vr_gpu_timing_get_latest(float*, float*, float*, float*) { return false; }
 float vr_get_world_scale() { return 1.0f; }
 void vr_set_world_scale(float) {}
 void vr_set_link_eye_height(float) {}
@@ -5472,6 +6103,9 @@ void* vr_get_hud_commands() { return nullptr; }
 void vr_begin_hud() {}
 void vr_end_hud() {}
 bool vr_is_rendering_hud() { return false; }
+bool vr_begin_key_world_pass() { return false; }
+void vr_end_key_world_pass() {}
+bool vr_is_key_world_pass() { return false; }
 void vr_set_text_commands(void*, const float*) {}
 void* vr_get_text_commands() { return nullptr; }
 void vr_set_text_panel_layout(float, float, float) {}
@@ -5479,6 +6113,8 @@ void vr_begin_text() {}
 void vr_end_text() {}
 bool vr_is_rendering_text() { return false; }
 bool vr_menu_panel_active() { return false; }
+bool vr_menu_interactive() { return false; }
+void vr_set_notifications_visible(bool) {}
 bool vr_can_disable() { return true; }
 int vr_get_supported_refresh_rates(float*, int) { return 0; }
 void vr_menu_panel_size(int* w, int* h) { *w = 0; *h = 0; }
@@ -5491,6 +6127,10 @@ void vr_set_hud_world_panel(bool, const float*, float, float, float) {}
 bool vr_hud_tri(const float*, float* out) { out[0] = out[3] = 1.0f; out[1] = out[2] = 0.0f; return true; }
 void vr_set_hud_child(bool) {}
 bool vr_get_hud_child() { return false; }
+bool vr_get_hud_element_hand_distance(int, int, float* distance_m) {
+    if (distance_m != nullptr) *distance_m = 0.0f;
+    return false;
+}
 bool vr_is_rendering_screen() { return false; }
 void vr_set_flat_screen(bool) {}
 bool vr_get_flat_screen() { return false; }
